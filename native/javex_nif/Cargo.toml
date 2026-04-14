@@ -1,0 +1,31 @@
+[package]
+name = "javex_nif"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+rust-version = "1.91"
+
+[lib]
+name = "javex_nif"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.37"
+wasmtime = "42"
+wasmtime-wasi = "42"
+javy-codegen = "4"
+# Pin to the version javy-codegen 4.0.0 was built against; the 4.0.1
+# patch release of deterministic-wasi-ctx bumped to wasmtime-wasi 43 and
+# breaks the dep tree otherwise.
+deterministic-wasi-ctx = "=4.0.0"
+wasmparser = "0.244"
+tokio = { version = "1", features = ["rt"] }
+sha2 = "0.10"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MIX_ENV: test
+  JAVEX_BUILD: "1"
+
+jobs:
+  lint:
+    name: Lint (Quokka + Credo)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/javex_nif/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/javex_nif/Cargo.toml', 'native/javex_nif/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: mix deps.get
+      - name: Check formatting (Quokka)
+        run: mix format --check-formatted
+      - name: Credo (strict)
+        run: mix credo --strict
+
+  compile:
+    name: Compile without warnings
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/javex_nif/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/javex_nif/Cargo.toml', 'native/javex_nif/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: mix deps.get
+      - run: mix compile --warnings-as-errors --force
+
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            deps
+            _build
+          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            native/javex_nif/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('native/javex_nif/Cargo.toml', 'native/javex_nif/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - run: mix deps.get
+      - run: mix test
