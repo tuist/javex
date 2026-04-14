@@ -25,9 +25,26 @@ def deps do
 end
 ```
 
-Javex ships a Rust NIF (built with [Rustler](https://github.com/rusterlium/rustler))
-that wraps `javy-codegen` and `wasmtime`. A Rust toolchain is required at
-build time. The Javy plugin Wasm is bundled in `priv/`.
+Add a runtime to your application's supervision tree:
+
+```elixir
+# lib/my_app/application.ex
+children = [
+  Javex.Runtime
+  # or: {Javex.Runtime, default_fuel: 1_000_000}
+]
+```
+
+`Javex.compile/2` works without any running process — it reads the
+bundled provider plugin from `priv/` directly — so scripts and tests
+can compile modules without starting a runtime.
+
+Javex ships a Rust NIF (built with
+[`rustler_precompiled`](https://github.com/philss/rustler_precompiled))
+that wraps `javy-codegen` and `wasmtime`. Precompiled artifacts are
+published as GitHub release assets, so consumers do not need a Rust
+toolchain. Set `JAVEX_BUILD=1` to force a local source build. The Javy
+plugin Wasm is bundled in `priv/`.
 
 ## API
 

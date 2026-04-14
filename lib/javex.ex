@@ -16,9 +16,14 @@ defmodule Javex do
       iex> Javex.run(mod, %{a: 1, b: 2})
       {:ok, %{"sum" => 3}}
 
-  The default runtime is started automatically under the `Javex.Application`
-  supervisor. For custom fuel or memory limits, start your own with
-  `Javex.Runtime.start_link/1`.
+  Starting a runtime is the consumer's responsibility. Add
+  `Javex.Runtime` (or `{Javex.Runtime, opts}`) to your application's
+  supervision tree. The default registered name is `Javex.Runtime`,
+  which is what `run/3` looks for unless you pass `:runtime`.
+
+  `compile/2` does **not** need a running runtime: it reads the bundled
+  provider plugin directly from `priv/` and is safe to call from one-off
+  scripts.
   """
 
   alias Javex.{Module, Runtime}

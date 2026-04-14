@@ -2,18 +2,23 @@ defmodule Javex.Runtime do
   @moduledoc """
   A wasmtime runtime with the Javy provider plugin preloaded.
 
-  The application starts one `Javex.Runtime` under its supervisor by
-  default, registered under the name `Javex.Runtime`. You can start
-  additional runtimes with different resource limits:
+  Starting a runtime is the consumer's responsibility. Add one to your
+  application's supervision tree:
 
-      {:ok, strict} =
-        Javex.Runtime.start_link(
-          name: :strict_runtime,
-          default_fuel: 1_000_000,
-          default_max_memory: 8 * 1024 * 1024
-        )
+      children = [
+        Javex.Runtime
+      ]
 
-      Javex.run(mod, input, runtime: :strict_runtime)
+  or with custom resource limits:
+
+      children = [
+        {Javex.Runtime, default_fuel: 1_000_000, default_max_memory: 8 * 1024 * 1024}
+      ]
+
+  The default registered name is `Javex.Runtime`, which is also the
+  default `:runtime` `Javex.run/3` looks for. Multiple runtimes with
+  different tiers can coexist — pass `:name` to give them distinct
+  registered names and `runtime: name` on each `run/3` call.
 
   A runtime owns a wasmtime `Engine`, an instantiated provider plugin,
   and a cache of precompiled user modules (indexed by content hash).
@@ -21,9 +26,7 @@ defmodule Javex.Runtime do
 
   use GenServer
 
-  alias Javex.{IncompatibleProviderError, Module, Native, RuntimeError}
-
-  @plugin_priv "javy_plugin.wasm"
+  alias Javex.{IncompatibleProviderError, Module, Native, Plugin, RuntimeError}
 
   ## Public API
 
@@ -33,7 +36,8 @@ defmodule Javex.Runtime do
   ## Options
 
     * `:name` - registered name. Defaults to `Javex.Runtime`.
-    * `:plugin_path` - override the bundled Javy plugin.
+    * `:plugin_path` - override the bundled Javy plugin. Advanced — only
+      needed to link against a non-bundled provider.
     * `:default_fuel` - fuel budget used by `run/4` when the caller does
       not specify one.
     * `:default_max_memory` - memory cap in bytes.
@@ -50,27 +54,16 @@ defmodule Javex.Runtime do
     GenServer.call(server, {:run, mod, input, opts}, call_timeout(opts))
   end
 
-  @doc """
-  Return the bytes of the Javy provider plugin this runtime was built
-  with. Used by `Javex.Module.compile/2` in dynamic mode so the compiled
-  module is linked against exactly the provider this runtime hosts.
-  """
-  @spec plugin_bytes(GenServer.server()) :: binary()
-  def plugin_bytes(server \\ __MODULE__) do
-    GenServer.call(server, :plugin_bytes)
-  end
-
   ## GenServer
 
   @impl true
   def init(opts) do
-    plugin_path = Keyword.get(opts, :plugin_path, default_plugin_path())
+    plugin_path = Keyword.get(opts, :plugin_path, Plugin.path())
 
     with {:ok, plugin} <- File.read(plugin_path),
          {:ok, native} <- Native.runtime_new(plugin) do
       state = %{
         native: native,
-        plugin: plugin,
         plugin_hash: :crypto.hash(:sha256, plugin),
         precompiled: %{},
         default_fuel: Keyword.get(opts, :default_fuel),
@@ -82,11 +75,6 @@ defmodule Javex.Runtime do
     else
       {:error, reason} -> {:stop, {:plugin_load_failed, reason}}
     end
-  end
-
-  @impl true
-  def handle_call(:plugin_bytes, _from, state) do
-    {:reply, state.plugin, state}
   end
 
   @impl true
@@ -105,10 +93,6 @@ defmodule Javex.Runtime do
   end
 
   ## Helpers
-
-  defp default_plugin_path do
-    Application.app_dir(:javex, ["priv", @plugin_priv])
-  end
 
   defp check_provider(%Module{mode: :static}, _state), do: :ok
 

@@ -34,11 +34,10 @@ defmodule Javex.Module do
   @spec compile(String.t(), keyword()) :: {:ok, t()} | {:error, CompileError.t()}
   def compile(source, opts) do
     mode = Keyword.get(opts, :mode, :dynamic)
-    runtime = Keyword.get(opts, :runtime, Javex.Runtime)
 
     plugin =
       case mode do
-        :dynamic -> Javex.Runtime.plugin_bytes(runtime)
+        :dynamic -> Javex.Plugin.bytes!()
         :static -> <<>>
       end
 
