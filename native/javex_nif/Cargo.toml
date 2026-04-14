@@ -1,0 +1,26 @@
+[package]
+name = "javex_nif"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "javex_nif"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+rustler = "0.36"
+wasmtime = { version = "24", default-features = false, features = ["cranelift", "runtime"] }
+wasmtime-wasi = "24"
+wasi-common = "24"
+javy-codegen = "4"
+sha2 = "0.10"
+anyhow = "1"
+thiserror = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
