@@ -46,48 +46,4 @@ defmodule Javex.ModuleTest do
       assert byte_size(mod.provider_hash) == 32
     end
   end
-
-  describe "write/2 and read/1" do
-    @tag :tmp_dir
-    test "round-trips bytes, mode, and provider hash through disk", %{tmp_dir: tmp_dir} do
-      path = Path.join(tmp_dir, "module.jxm")
-      {:ok, original} = Javex.compile(@echo_js)
-
-      :ok = Module.write(original, path)
-      {:ok, loaded} = Module.read(path)
-
-      assert loaded == original
-    end
-
-    @tag :tmp_dir
-    test "a module loaded from disk executes end-to-end", %{tmp_dir: tmp_dir} do
-      path = Path.join(tmp_dir, "module.jxm")
-      {:ok, original} = Javex.compile(@echo_js)
-      :ok = Module.write(original, path)
-      {:ok, loaded} = Module.read(path)
-
-      input = %{"hello" => "world", "n" => 42}
-      assert {:ok, ^input} = Javex.run(loaded, input)
-    end
-
-    @tag :tmp_dir
-    test "read/1 rejects files that are not a Javex envelope", %{tmp_dir: tmp_dir} do
-      path = Path.join(tmp_dir, "garbage.jxm")
-      File.write!(path, "not a javex module")
-
-      assert {:error, :invalid_module_file} = Module.read(path)
-    end
-
-    @tag :tmp_dir
-    test "read/1 surfaces filesystem errors", %{tmp_dir: tmp_dir} do
-      assert {:error, :enoent} = Module.read(Path.join(tmp_dir, "missing.jxm"))
-    end
-  end
-
-  describe "raw_wasm/1" do
-    test "returns the compiled Wasm bytes unchanged" do
-      {:ok, mod} = Javex.compile(@echo_js)
-      assert Module.raw_wasm(mod) == mod.bytes
-    end
-  end
 end

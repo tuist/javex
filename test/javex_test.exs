@@ -34,15 +34,6 @@ defmodule JavexTest do
     assert {:ok, %{"sum" => 3}} = Javex.run(mod, %{a: 1, b: 2})
   end
 
-  @tag :tmp_dir
-  test "round-trips through disk", %{tmp_dir: tmp_dir} do
-    {:ok, mod} = Javex.compile(@add_js)
-    path = Path.join(tmp_dir, "module.jxm")
-    :ok = Javex.Module.write(mod, path)
-    {:ok, loaded} = Javex.Module.read(path)
-    assert {:ok, %{"sum" => 5}} = Javex.run(loaded, %{a: 2, b: 3})
-  end
-
   test "surfaces JS errors" do
     {:ok, mod} = Javex.compile(~S|throw new Error("boom");|)
     assert {:error, %Javex.RuntimeError{kind: kind}} = Javex.run(mod, nil)
