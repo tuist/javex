@@ -1,24 +1,16 @@
 // Javex NIF
 //
 // Bridges Elixir <-> Javy (JS -> Wasm) and wasmtime (Wasm execution).
-//
-// Resources exposed to the BEAM:
-//   - Runtime:     { Engine, plugin_module, plugin_import_name }
-//   - Precompiled: { compiled user Wasm module }
-//
-// Dynamic linking model: the plugin is instantiated once per user-module
-// instantiation and its exports are registered under its canonical
-// import name so the user module's imports resolve. Static modules
-// embed QuickJS themselves and do not need a plugin.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use rustler::{Atom, Binary, Env, NewBinary, NifResult, OwnedBinary, ResourceArc, Term};
+use rustler::{Atom, Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
 use sha2::{Digest, Sha256};
-use wasmtime::{Config, Engine, Linker, Module as WasmModule, Store};
-use wasmtime_wasi::preview1::{self, WasiP1Ctx};
+use wasmtime::{AsContextMut, Config, Engine, Linker, Module as WasmModule, OptLevel, Store};
 use wasmtime_wasi::WasiCtxBuilder;
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 
 mod atoms {
     rustler::atoms! {
@@ -43,26 +35,22 @@ mod atoms {
 pub struct RuntimeResource {
     engine: Engine,
     plugin_module: WasmModule,
-    plugin_import_name: String,
+    import_namespace: String,
 }
 
 pub struct PrecompiledResource {
     module: WasmModule,
 }
 
+#[rustler::resource_impl]
+impl rustler::Resource for RuntimeResource {}
+
+#[rustler::resource_impl]
+impl rustler::Resource for PrecompiledResource {}
+
 // ---- NIF init ----------------------------------------------------------
 
-fn load(env: Env, _info: Term) -> bool {
-    rustler::resource!(RuntimeResource, env);
-    rustler::resource!(PrecompiledResource, env);
-    true
-}
-
-rustler::init!(
-    "Elixir.Javex.Native",
-    [compile, runtime_new, module_precompile, run],
-    load = load
-);
+rustler::init!("Elixir.Javex.Native");
 
 // ---- compile -----------------------------------------------------------
 
@@ -75,10 +63,12 @@ fn compile<'a>(
 ) -> NifResult<Term<'a>> {
     let mode = decode_mode(mode)?;
 
-    let result = if mode == Mode::Dynamic {
-        compile_dynamic(plugin.as_slice(), source.as_slice())
-    } else {
-        compile_static(source.as_slice())
+    let source_bytes = source.as_slice().to_vec();
+    let plugin_bytes = plugin.as_slice().to_vec();
+
+    let result = match mode {
+        Mode::Dynamic => compile_dynamic(plugin_bytes, source_bytes),
+        Mode::Static => compile_static(source_bytes),
     };
 
     match result {
@@ -89,7 +79,10 @@ fn compile<'a>(
             let mut hash_bin = OwnedBinary::new(hash.len()).unwrap();
             hash_bin.as_mut_slice().copy_from_slice(&hash);
 
-            let tuple = (Binary::from_owned(wasm_bin, env), Binary::from_owned(hash_bin, env));
+            let tuple = (
+                Binary::from_owned(wasm_bin, env),
+                Binary::from_owned(hash_bin, env),
+            );
             Ok((atoms::ok(), tuple).encode(env))
         }
         Err(e) => Ok((atoms::error(), format!("{e:#}")).encode(env)),
@@ -112,38 +105,48 @@ fn decode_mode(atom: Atom) -> NifResult<Mode> {
     }
 }
 
-fn compile_dynamic(plugin: &[u8], source: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    use javy_codegen::{Generator, LinkingKind, Plugin};
+fn compile_dynamic(plugin_bytes: Vec<u8>, source: Vec<u8>) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use javy_codegen::{Generator, JS, LinkingKind, Plugin};
 
-    let mut generator = Generator::new();
-    generator
-        .linking(LinkingKind::Dynamic)
-        .plugin(Plugin::User {
-            bytes: plugin.to_vec(),
-        });
+    let source_str = String::from_utf8(source)?;
+    let js = JS::from_string(source_str);
 
-    let wasm = generator.generate(source)?;
-    let hash = Sha256::digest(plugin).to_vec();
+    let plugin = Plugin::new(plugin_bytes.clone().into())?;
+    let mut generator = Generator::new(plugin);
+    generator.linking(LinkingKind::Dynamic);
+
+    let wasm = block_on(generator.generate(&js))?;
+    let hash = Sha256::digest(&plugin_bytes).to_vec();
     Ok((wasm, hash))
 }
 
-fn compile_static(source: &[u8]) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
-    use javy_codegen::{Generator, LinkingKind, Plugin};
+fn compile_static(source: Vec<u8>) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    use javy_codegen::{Generator, JS, LinkingKind, Plugin};
 
-    let mut generator = Generator::new();
-    generator
-        .linking(LinkingKind::Static)
-        .plugin(Plugin::Default);
+    let source_str = String::from_utf8(source)?;
+    let js = JS::from_string(source_str);
 
-    let wasm = generator.generate(source)?;
+    let plugin = Plugin::default();
+    let mut generator = Generator::new(plugin);
+    generator.linking(LinkingKind::Static);
+
+    let wasm = block_on(generator.generate(&js))?;
     Ok((wasm, Vec::new()))
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    rt.block_on(fut)
 }
 
 // ---- runtime_new -------------------------------------------------------
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn runtime_new(env: Env, plugin: Binary) -> NifResult<Term> {
-    match build_runtime(plugin.as_slice()) {
+fn runtime_new<'a>(env: Env<'a>, plugin: Binary<'a>) -> NifResult<Term<'a>> {
+    match build_runtime(plugin.as_slice().to_vec()) {
         Ok(runtime) => {
             let resource = ResourceArc::new(runtime);
             Ok((atoms::ok(), resource).encode(env))
@@ -152,41 +155,44 @@ fn runtime_new(env: Env, plugin: Binary) -> NifResult<Term> {
     }
 }
 
-fn build_runtime(plugin: &[u8]) -> anyhow::Result<RuntimeResource> {
+fn build_runtime(plugin_bytes: Vec<u8>) -> anyhow::Result<RuntimeResource> {
     let mut config = Config::new();
+    config.cranelift_opt_level(OptLevel::SpeedAndSize);
     config.consume_fuel(true);
     config.epoch_interruption(true);
 
     let engine = Engine::new(&config)?;
-    let plugin_module = WasmModule::from_binary(&engine, plugin)?;
-    let plugin_import_name = detect_plugin_name(&plugin_module)?;
+    let plugin_module = WasmModule::from_binary(&engine, &plugin_bytes)?;
+    let import_namespace = detect_import_namespace(&plugin_bytes)?;
 
     Ok(RuntimeResource {
         engine,
         plugin_module,
-        plugin_import_name,
+        import_namespace,
     })
 }
 
-/// Discover the canonical module name that dynamic user modules use to
-/// import from this plugin. Javy plugins export themselves with a
-/// versioned name like `javy_quickjs_provider_v3`. Rather than hardcode
-/// a version we read it from the plugin's exports.
-fn detect_plugin_name(module: &WasmModule) -> anyhow::Result<String> {
-    for export in module.exports() {
-        let name = export.name();
-        if name.starts_with("javy_quickjs_provider") {
-            return Ok(name.to_string());
+fn detect_import_namespace(plugin_bytes: &[u8]) -> anyhow::Result<String> {
+    use wasmparser::{Parser, Payload};
+
+    for payload in Parser::new(0).parse_all(plugin_bytes) {
+        if let Ok(Payload::CustomSection(c)) = payload
+            && c.name() == "import_namespace"
+        {
+            return Ok(std::str::from_utf8(c.data())?.to_string());
         }
     }
-    // Fall back to the convention used by recent Javy releases.
-    Ok("javy_quickjs_provider_v3".to_string())
+    anyhow::bail!("plugin is missing `import_namespace` custom section")
 }
 
 // ---- module_precompile -------------------------------------------------
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn module_precompile(env: Env, runtime: ResourceArc<RuntimeResource>, wasm: Binary) -> NifResult<Term> {
+fn module_precompile<'a>(
+    env: Env<'a>,
+    runtime: ResourceArc<RuntimeResource>,
+    wasm: Binary<'a>,
+) -> NifResult<Term<'a>> {
     match WasmModule::from_binary(&runtime.engine, wasm.as_slice()) {
         Ok(module) => {
             let resource = ResourceArc::new(PrecompiledResource { module });
@@ -198,7 +204,7 @@ fn module_precompile(env: Env, runtime: ResourceArc<RuntimeResource>, wasm: Bina
 
 // ---- run ---------------------------------------------------------------
 
-struct RunState {
+struct StoreContext {
     wasi: WasiP1Ctx,
 }
 
@@ -221,9 +227,7 @@ fn run<'a>(
         Err(RunError::Timeout) => Ok((atoms::error(), atoms::timeout()).encode(env)),
         Err(RunError::FuelExhausted) => Ok((atoms::error(), atoms::fuel_exhausted()).encode(env)),
         Err(RunError::Oom) => Ok((atoms::error(), atoms::oom()).encode(env)),
-        Err(RunError::JsError(msg)) => {
-            Ok((atoms::error(), (atoms::js_error(), msg)).encode(env))
-        }
+        Err(RunError::JsError(msg)) => Ok((atoms::error(), (atoms::js_error(), msg)).encode(env)),
         Err(RunError::Trap(msg)) => Ok((atoms::error(), (atoms::trap(), msg)).encode(env)),
     }
 }
@@ -232,31 +236,30 @@ fn run<'a>(
 struct RunOpts {
     timeout_ms: Option<u64>,
     fuel: Option<u64>,
-    max_memory: Option<u64>,
+    _max_memory: Option<u64>,
     env: Vec<(String, String)>,
 }
 
 impl RunOpts {
     fn decode(term: Term) -> NifResult<Self> {
-        use rustler::MapIterator;
-
+        let env = term.get_env();
         let mut opts = RunOpts::default();
-        if let Ok(iter) = MapIterator::new(term) {
-            for (k, v) in iter {
-                let key: Atom = k.decode()?;
-                if key == atoms::timeout_ms() {
-                    opts.timeout_ms = v.decode().ok();
-                } else if key == atoms::fuel() {
-                    opts.fuel = v.decode().ok();
-                } else if key == atoms::max_memory() {
-                    opts.max_memory = v.decode().ok();
-                } else if key == atoms::env() {
-                    if let Ok(list) = v.decode::<Vec<(String, String)>>() {
-                        opts.env = list;
-                    }
-                }
-            }
+
+        if let Ok(v) = term.map_get(atoms::timeout_ms().to_term(env)) {
+            opts.timeout_ms = v.decode::<u64>().ok();
         }
+        if let Ok(v) = term.map_get(atoms::fuel().to_term(env)) {
+            opts.fuel = v.decode::<u64>().ok();
+        }
+        if let Ok(v) = term.map_get(atoms::max_memory().to_term(env)) {
+            opts._max_memory = v.decode::<u64>().ok();
+        }
+        if let Ok(v) = term.map_get(atoms::env().to_term(env))
+            && let Ok(list) = v.decode::<Vec<(String, String)>>()
+        {
+            opts.env = list;
+        }
+
         Ok(opts)
     }
 }
@@ -276,8 +279,6 @@ fn run_inner(
     input: &[u8],
     opts: RunOpts,
 ) -> Result<Vec<u8>, RunError> {
-    use wasmtime_wasi::pipe::{MemoryInputPipe, MemoryOutputPipe};
-
     let stdin = MemoryInputPipe::new(input.to_vec());
     let stdout = MemoryOutputPipe::new(usize::MAX);
 
@@ -288,46 +289,57 @@ fn run_inner(
     }
     let wasi = builder.build_p1();
 
-    let mut store = Store::new(&runtime.engine, RunState { wasi });
+    let ctx = StoreContext { wasi };
+    let mut store: Store<StoreContext> = Store::new(&runtime.engine, ctx);
 
     if let Some(fuel) = opts.fuel {
-        let _ = store.set_fuel(fuel);
+        store
+            .set_fuel(fuel)
+            .map_err(|e| RunError::Trap(format!("set_fuel: {e:#}")))?;
     } else {
-        let _ = store.set_fuel(u64::MAX);
+        store
+            .set_fuel(u64::MAX)
+            .map_err(|e| RunError::Trap(format!("set_fuel: {e:#}")))?;
     }
 
-    let mut linker: Linker<RunState> = Linker::new(&runtime.engine);
-    preview1::add_to_linker_sync(&mut linker, |s: &mut RunState| &mut s.wasi)
+    if opts.timeout_ms.is_some() {
+        store.set_epoch_deadline(1);
+    }
+
+    let mut linker: Linker<StoreContext> = Linker::new(&runtime.engine);
+    p1::add_to_linker_sync(&mut linker, |c: &mut StoreContext| &mut c.wasi)
         .map_err(|e| RunError::Trap(format!("linker init: {e:#}")))?;
 
-    // Instantiate the plugin and register its exports so the user
-    // module's dynamic imports resolve.
+    // Instantiate the plugin against the linker, then register its
+    // instance under the plugin's import namespace so the user module's
+    // dynamic imports resolve.
+    linker.allow_shadowing(true);
     let plugin_instance = linker
-        .instantiate(&mut store, &runtime.plugin_module)
+        .instantiate(store.as_context_mut(), &runtime.plugin_module)
         .map_err(|e| RunError::Trap(format!("plugin instantiate: {e:#}")))?;
+    linker
+        .instance(
+            store.as_context_mut(),
+            &runtime.import_namespace,
+            plugin_instance,
+        )
+        .map_err(|e| RunError::Trap(format!("plugin register: {e:#}")))?;
 
-    for export in runtime.plugin_module.exports() {
-        if let Some(ext) = plugin_instance.get_export(&mut store, export.name()) {
-            linker
-                .define(&mut store, &runtime.plugin_import_name, export.name(), ext)
-                .map_err(|e| RunError::Trap(format!("plugin define: {e:#}")))?;
-        }
-    }
+    let epoch_handle = opts
+        .timeout_ms
+        .map(|ms| spawn_epoch_ticker(runtime.engine.clone(), ms));
 
-    // Timeout via epoch interruption.
-    let epoch_thread = opts.timeout_ms.map(|ms| spawn_epoch_ticker(runtime.engine.clone(), ms));
+    let instance = linker
+        .instantiate(store.as_context_mut(), &precompiled.module)
+        .map_err(classify_trap)?;
 
-    let user_instance = linker
-        .instantiate(&mut store, &precompiled.module)
-        .map_err(|e| classify_trap(e))?;
-
-    let start = user_instance
-        .get_typed_func::<(), ()>(&mut store, "_start")
+    let start = instance
+        .get_typed_func::<(), ()>(store.as_context_mut(), "_start")
         .map_err(|e| RunError::Trap(format!("missing _start: {e:#}")))?;
 
-    let call_result = start.call(&mut store, ());
+    let call_result = start.call(store.as_context_mut(), ());
 
-    if let Some(handle) = epoch_thread {
+    if let Some(handle) = epoch_handle {
         handle.stop();
     }
 
@@ -342,15 +354,15 @@ fn run_inner(
     Ok(bytes)
 }
 
-fn classify_trap(err: anyhow::Error) -> RunError {
-    let msg = format!("{err:#}");
+fn classify_trap<E: std::fmt::Display>(err: E) -> RunError {
+    let msg = format!("{err}");
     if msg.contains("all fuel consumed") {
         RunError::FuelExhausted
     } else if msg.contains("epoch deadline") || msg.contains("interrupt") {
         RunError::Timeout
     } else if msg.contains("out of memory") || msg.contains("memory limit") {
         RunError::Oom
-    } else if msg.contains("JavaScript") || msg.contains("Uncaught") {
+    } else if msg.contains("Uncaught") || msg.contains("JavaScript") {
         RunError::JsError(msg)
     } else {
         RunError::Trap(msg)
@@ -358,7 +370,7 @@ fn classify_trap(err: anyhow::Error) -> RunError {
 }
 
 struct EpochHandle {
-    stop: std::sync::Arc<Mutex<bool>>,
+    stop: Arc<Mutex<bool>>,
 }
 
 impl EpochHandle {
@@ -368,7 +380,7 @@ impl EpochHandle {
 }
 
 fn spawn_epoch_ticker(engine: Engine, timeout_ms: u64) -> EpochHandle {
-    let stop = std::sync::Arc::new(Mutex::new(false));
+    let stop = Arc::new(Mutex::new(false));
     let stop_clone = stop.clone();
 
     std::thread::spawn(move || {
@@ -380,5 +392,3 @@ fn spawn_epoch_ticker(engine: Engine, timeout_ms: u64) -> EpochHandle {
 
     EpochHandle { stop }
 }
-
-use rustler::Encoder;

@@ -133,7 +133,8 @@ defmodule Javex.Runtime do
       :error ->
         case Native.module_precompile(state.native, mod.bytes) do
           {:ok, precompiled} ->
-            {:ok, precompiled, %{state | precompiled: Map.put(state.precompiled, key, precompiled)}}
+            {:ok, precompiled,
+             %{state | precompiled: Map.put(state.precompiled, key, precompiled)}}
 
           {:error, reason} ->
             {:error, reason}
@@ -175,7 +176,10 @@ defmodule Javex.Runtime do
   end
 
   defp translate(:timeout), do: %RuntimeError{kind: :timeout, message: "execution timed out"}
-  defp translate(:fuel_exhausted), do: %RuntimeError{kind: :fuel_exhausted, message: "fuel exhausted"}
+
+  defp translate(:fuel_exhausted),
+    do: %RuntimeError{kind: :fuel_exhausted, message: "fuel exhausted"}
+
   defp translate(:oom), do: %RuntimeError{kind: :oom, message: "memory limit exceeded"}
   defp translate({:js_error, message}), do: %RuntimeError{kind: :js_error, message: message}
   defp translate({:trap, message}), do: %RuntimeError{kind: :trap, message: message}
