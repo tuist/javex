@@ -51,7 +51,26 @@ defmodule Javex.Runtime do
 
   @doc false
   def run(server, %Module{} = mod, input, opts) do
-    GenServer.call(server, {:run, mod, input, opts}, call_timeout(opts))
+    # The NIF enforces the wall-clock deadline via epoch interruption,
+    # using the runtime's `default_timeout` when the caller omits
+    # `:timeout`. The GenServer.call deadline must therefore simply be
+    # larger than whatever the NIF will honour, so we pass `:infinity`
+    # and let the NIF be the single source of truth.
+    GenServer.call(server, {:run, mod, input, opts}, :infinity)
+  end
+
+  @doc """
+  Return the bytes of the Javy provider plugin this runtime was built
+  with.
+
+  Used by `Javex.compile/2` so that a module compiled against a runtime
+  with a custom `:plugin_path` is linked against exactly the provider
+  that runtime hosts, instead of silently defaulting to the bundled
+  plugin.
+  """
+  @spec plugin_bytes(GenServer.server()) :: binary()
+  def plugin_bytes(server \\ __MODULE__) do
+    GenServer.call(server, :plugin_bytes)
   end
 
   ## GenServer
@@ -64,6 +83,7 @@ defmodule Javex.Runtime do
          {:ok, native} <- Native.runtime_new(plugin) do
       state = %{
         native: native,
+        plugin: plugin,
         plugin_hash: :crypto.hash(:sha256, plugin),
         precompiled: %{},
         default_fuel: Keyword.get(opts, :default_fuel),
@@ -75,6 +95,11 @@ defmodule Javex.Runtime do
     else
       {:error, reason} -> {:stop, {:plugin_load_failed, reason}}
     end
+  end
+
+  @impl true
+  def handle_call(:plugin_bytes, _from, state) do
+    {:reply, state.plugin, state}
   end
 
   @impl true
@@ -149,13 +174,6 @@ defmodule Javex.Runtime do
       max_memory: Keyword.get(opts, :max_memory, state.default_max_memory),
       env: Keyword.get(opts, :env, [])
     }
-  end
-
-  defp call_timeout(opts) do
-    case Keyword.get(opts, :timeout) do
-      nil -> 10_000
-      ms when is_integer(ms) -> ms + 2_000
-    end
   end
 
   defp translate(:timeout), do: %RuntimeError{kind: :timeout, message: "execution timed out"}

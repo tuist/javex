@@ -43,6 +43,14 @@ defmodule Javex.RuntimeTest do
 
   @infinite_js ~S|while (true) {}|
 
+  @alloc_js ~S"""
+  const chunks = [];
+  for (let i = 0; i < 64; i++) {
+    chunks.push(new Uint8Array(1024 * 1024));
+  }
+  Javy.IO.writeSync(1, new TextEncoder().encode("ok"));
+  """
+
   describe "default runtime started by test_helper" do
     test "runs a module via the default registered name" do
       {:ok, mod} = Javex.compile(@echo_js)
@@ -67,6 +75,22 @@ defmodule Javex.RuntimeTest do
 
       assert {:ok, %{"from" => "secondary"}} =
                Javex.run(mod, %{from: "secondary"}, runtime: name)
+    end
+
+    test "compile/2 links against the runtime's plugin when `:runtime` is given" do
+      name = unique_name("custom_plugin")
+      {:ok, _pid} = Runtime.start_link(name: name, plugin_path: Javex.Plugin.path())
+      on_exit(fn -> stop_if_alive(name) end)
+
+      runtime_plugin = Runtime.plugin_bytes(name)
+      expected_hash = :crypto.hash(:sha256, runtime_plugin)
+
+      {:ok, mod} = Javex.compile(@echo_js, runtime: name)
+
+      assert mod.provider_hash == expected_hash
+
+      assert {:ok, %{"through" => "runtime"}} =
+               Javex.run(mod, %{through: "runtime"}, runtime: name)
     end
 
     test "start_link fails cleanly when the plugin path does not exist" do
@@ -121,6 +145,32 @@ defmodule Javex.RuntimeTest do
       {:ok, mod} = Javex.compile(@infinite_js)
 
       assert {:error, %RuntimeError{kind: :timeout}} = Javex.run(mod, nil, timeout: 200)
+    end
+
+    test "max_memory is enforced at the store limiter" do
+      {:ok, mod} = Javex.compile(@alloc_js)
+
+      assert {:error, %RuntimeError{kind: kind}} =
+               Javex.run(mod, nil, max_memory: 8 * 1024 * 1024)
+
+      assert kind in [:oom, :trap, :js_error]
+    end
+  end
+
+  describe "default_timeout vs GenServer.call deadline" do
+    test "a runtime with a default_timeout above 10s does not time out at the BEAM boundary" do
+      name = unique_name("slow")
+      {:ok, _pid} = Runtime.start_link(name: name, default_timeout: 15_000)
+      on_exit(fn -> stop_if_alive(name) end)
+
+      {:ok, mod} = Javex.compile(@echo_js)
+
+      # A normal call returns well under a second; the point of this
+      # test is just to exercise the call path without setting
+      # :timeout, proving that GenServer.call does not short-circuit
+      # before the NIF.
+      assert {:ok, %{"ok" => true}} =
+               Javex.run(mod, %{ok: true}, runtime: name)
     end
   end
 

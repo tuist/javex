@@ -9,7 +9,7 @@ use rustler::{Atom, Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, T
 use sha2::{Digest, Sha256};
 use wasmtime::{
     AsContextMut, Config, Engine, Error as WasmError, Linker, Module as WasmModule, OptLevel,
-    Store, Trap,
+    Store, StoreLimits, StoreLimitsBuilder, Trap,
 };
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
@@ -209,6 +209,7 @@ fn module_precompile<'a>(
 
 struct StoreContext {
     wasi: WasiP1Ctx,
+    limits: StoreLimits,
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
@@ -239,7 +240,7 @@ fn run<'a>(
 struct RunOpts {
     timeout_ms: Option<u64>,
     fuel: Option<u64>,
-    _max_memory: Option<u64>,
+    max_memory: Option<u64>,
     env: Vec<(String, String)>,
 }
 
@@ -255,7 +256,7 @@ impl RunOpts {
             opts.fuel = v.decode::<u64>().ok();
         }
         if let Ok(v) = term.map_get(atoms::max_memory().to_term(env)) {
-            opts._max_memory = v.decode::<u64>().ok();
+            opts.max_memory = v.decode::<u64>().ok();
         }
         if let Ok(v) = term.map_get(atoms::env().to_term(env))
             && let Ok(list) = v.decode::<Vec<(String, String)>>()
@@ -292,8 +293,16 @@ fn run_inner(
     }
     let wasi = builder.build_p1();
 
-    let ctx = StoreContext { wasi };
+    let limits = match opts.max_memory {
+        Some(max) => StoreLimitsBuilder::new()
+            .memory_size(max as usize)
+            .build(),
+        None => StoreLimitsBuilder::new().build(),
+    };
+
+    let ctx = StoreContext { wasi, limits };
     let mut store: Store<StoreContext> = Store::new(&runtime.engine, ctx);
+    store.limiter(|c| &mut c.limits);
 
     if let Some(fuel) = opts.fuel {
         store

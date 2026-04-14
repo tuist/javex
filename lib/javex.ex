@@ -41,9 +41,23 @@ defmodule Javex do
       QuickJS and can run without a runtime that has the plugin loaded,
       at the cost of ~1MB per module and slower cold starts.
 
+    * `:runtime` - a `Javex.Runtime` server (pid, name, or `{:via, ...}`)
+      to source the provider plugin from. Required when you intend to
+      run the module on a runtime started with a custom `:plugin_path`,
+      otherwise the compiled module will be hashed against the bundled
+      plugin and rejected as incompatible at run time.
+
+    * `:plugin` - raw plugin bytes. Advanced escape hatch when you have
+      the plugin in hand already and do not want Javex to source it
+      through a runtime or the bundled file.
+
+  When neither `:runtime` nor `:plugin` is given, the bundled
+  `priv/javy_plugin.wasm` is used.
+
   ## Examples
 
-      {:ok, mod} = Javex.compile("writeOutput('hello')")
+      {:ok, mod} = Javex.compile(js)
+      {:ok, mod} = Javex.compile(js, runtime: :strict_runtime)
   """
   @spec compile(String.t(), keyword()) :: {:ok, Module.t()} | {:error, term()}
   def compile(source, opts \\ []) when is_binary(source) do
