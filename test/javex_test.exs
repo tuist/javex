@@ -1,5 +1,5 @@
 defmodule JavexTest do
-  use ExUnit.Case, async: false
+  use ExUnit.Case, async: true
 
   @add_js ~S"""
   function readInput() {
@@ -34,14 +34,13 @@ defmodule JavexTest do
     assert {:ok, %{"sum" => 3}} = Javex.run(mod, %{a: 1, b: 2})
   end
 
-  test "round-trips through disk" do
+  @tag :tmp_dir
+  test "round-trips through disk", %{tmp_dir: tmp_dir} do
     {:ok, mod} = Javex.compile(@add_js)
-    path = Path.join(System.tmp_dir!(), "javex_test_#{System.unique_integer([:positive])}.jxm")
+    path = Path.join(tmp_dir, "module.jxm")
     :ok = Javex.Module.write(mod, path)
     {:ok, loaded} = Javex.Module.read(path)
     assert {:ok, %{"sum" => 5}} = Javex.run(loaded, %{a: 2, b: 3})
-  after
-    File.rm_rf!(Path.join(System.tmp_dir!(), "javex_test_*"))
   end
 
   test "surfaces JS errors" do

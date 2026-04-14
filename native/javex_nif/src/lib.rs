@@ -7,7 +7,10 @@ use std::time::Duration;
 
 use rustler::{Atom, Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
 use sha2::{Digest, Sha256};
-use wasmtime::{AsContextMut, Config, Engine, Linker, Module as WasmModule, OptLevel, Store};
+use wasmtime::{
+    AsContextMut, Config, Engine, Error as WasmError, Linker, Module as WasmModule, OptLevel,
+    Store, Trap,
+};
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
@@ -354,15 +357,18 @@ fn run_inner(
     Ok(bytes)
 }
 
-fn classify_trap<E: std::fmt::Display>(err: E) -> RunError {
-    let msg = format!("{err}");
-    if msg.contains("all fuel consumed") {
-        RunError::FuelExhausted
-    } else if msg.contains("epoch deadline") || msg.contains("interrupt") {
-        RunError::Timeout
-    } else if msg.contains("out of memory") || msg.contains("memory limit") {
-        RunError::Oom
-    } else if msg.contains("Uncaught") || msg.contains("JavaScript") {
+fn classify_trap(err: WasmError) -> RunError {
+    if let Some(trap) = err.downcast_ref::<Trap>() {
+        match trap {
+            Trap::Interrupt => return RunError::Timeout,
+            Trap::OutOfFuel => return RunError::FuelExhausted,
+            Trap::MemoryOutOfBounds | Trap::AllocationTooLarge => return RunError::Oom,
+            _ => {}
+        }
+    }
+
+    let msg = format!("{err:#}");
+    if msg.contains("Uncaught") || msg.contains("JavaScript") {
         RunError::JsError(msg)
     } else {
         RunError::Trap(msg)
