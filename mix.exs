@@ -27,6 +27,8 @@ defmodule Javex.MixProject do
       {:rustler_precompiled, "~> 0.8"},
       {:rustler, "~> 0.36", optional: true},
       {:jason, "~> 1.4"},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:quokka, "~> 2.7", only: [:dev, :test], runtime: false},
       {:ex_doc, "~> 0.34", only: :dev, runtime: false}
     ]
   end

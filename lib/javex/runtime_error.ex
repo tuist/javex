@@ -19,6 +19,5 @@ defmodule Javex.RuntimeError do
   defexception [:kind, :message]
 
   @impl true
-  def message(%__MODULE__{kind: kind, message: msg}),
-    do: "Javex runtime error (#{kind}): #{msg}"
+  def message(%__MODULE__{kind: kind, message: msg}), do: "Javex runtime error (#{kind}): #{msg}"
 end

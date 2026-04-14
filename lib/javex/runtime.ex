@@ -96,8 +96,7 @@ defmodule Javex.Runtime do
 
   defp check_provider(%Module{mode: :static}, _state), do: :ok
 
-  defp check_provider(%Module{mode: :dynamic, provider_hash: hash}, %{plugin_hash: hash}),
-    do: :ok
+  defp check_provider(%Module{mode: :dynamic, provider_hash: hash}, %{plugin_hash: hash}), do: :ok
 
   defp check_provider(%Module{mode: :dynamic, provider_hash: got}, %{plugin_hash: expected}) do
     {:error,
