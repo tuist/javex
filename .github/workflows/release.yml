@@ -16,35 +16,75 @@ jobs:
       matrix:
         nif: ["2.16"]
         job:
-          - { target: aarch64-apple-darwin,       os: macos-14 }
-          - { target: x86_64-apple-darwin,        os: macos-13 }
-          - { target: x86_64-unknown-linux-gnu,   os: ubuntu-22.04 }
-          - { target: aarch64-unknown-linux-gnu,  os: ubuntu-22.04-arm }
+          # Both Apple targets build on the native Apple Silicon runner;
+          # x86_64-apple-darwin is a cross-compile from arm64 using the
+          # stock rustup target, which is fine because no C deps of the
+          # NIF need native compilation at that target.
+          - { target: aarch64-apple-darwin,      os: macos-14,         lib-ext: dylib }
+          - { target: x86_64-apple-darwin,       os: macos-14,         lib-ext: dylib }
+          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     lib-ext: so    }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, lib-ext: so    }
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.job.target }}
 
       - name: Extract project version
         id: version
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Build precompiled NIF
-        id: build
-        uses: philss/rustler-precompiled-action@v1.1.5
-        with:
-          project-name: javex_nif
-          project-version: ${{ steps.version.outputs.version }}
-          target: ${{ matrix.job.target }}
-          nif-version: ${{ matrix.nif }}
-          use-cross: false
-          project-dir: native/javex_nif
+      - name: Compute NIF feature flag
+        id: feature
+        shell: bash
+        run: |
+          echo "flag=nif_version_$(echo ${{ matrix.nif }} | tr . _)" >> "$GITHUB_OUTPUT"
+
+      - name: Build NIF
+        shell: bash
+        working-directory: native/javex_nif
+        run: |
+          cargo build --release \
+            --target ${{ matrix.job.target }} \
+            --no-default-features \
+            --features ${{ steps.feature.outputs.flag }}
+
+      - name: Package artifact
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.version.outputs.version }}"
+          NIF="${{ matrix.nif }}"
+          TARGET="${{ matrix.job.target }}"
+          SRC_EXT="${{ matrix.job.lib-ext }}"
+
+          # rustler_precompiled expects the artifact to be named with
+          # a `.so` suffix in the tarball regardless of the host
+          # platform, because Rustler renames all NIF shared libraries
+          # to .so inside priv/native at load time.
+          NAME="libjavex_nif-v${VERSION}-nif-${NIF}-${TARGET}"
+          ARCHIVE="${NAME}.so.tar.gz"
+
+          SRC="native/javex_nif/target/${TARGET}/release/libjavex_nif.${SRC_EXT}"
+          STAGE="$(mktemp -d)"
+          cp "${SRC}" "${STAGE}/${NAME}.so"
+          tar -C "${STAGE}" -czf "${ARCHIVE}" "${NAME}.so"
+
+          echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "name=${ARCHIVE}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.build.outputs.file-name }}
-          path: ${{ steps.build.outputs.file-path }}
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
   publish_release:
