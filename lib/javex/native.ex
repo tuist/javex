@@ -16,7 +16,7 @@ defmodule Javex.Native do
     base_url: "https://github.com/tuist/javex/releases/download/v#{version}",
     force_build: System.get_env("JAVEX_BUILD") in ["1", "true"],
     version: version,
-    nif_versions: ["2.15", "2.16"],
+    nif_versions: ["2.16"],
     targets: ~w(
       aarch64-apple-darwin
       x86_64-apple-darwin
