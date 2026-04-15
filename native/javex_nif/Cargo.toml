@@ -11,8 +11,16 @@ name = "javex_nif"
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
+# Rustler 0.30+ requires NIF version features so rustler_precompiled's
+# build action can pick the right one via --features nif_version_2_XX.
+[features]
+default = ["nif_version_2_15"]
+nif_version_2_15 = ["rustler/nif_version_2_15"]
+nif_version_2_16 = ["rustler/nif_version_2_16"]
+nif_version_2_17 = ["rustler/nif_version_2_17"]
+
 [dependencies]
-rustler = "0.37"
+rustler = { version = "0.37", default-features = false }
 wasmtime = "42"
 wasmtime-wasi = "42"
 javy-codegen = "4"
