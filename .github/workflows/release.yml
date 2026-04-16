@@ -127,3 +127,51 @@ jobs:
           name: ${{ github.ref_name }}
           draft: false
           prerelease: false
+
+  publish_hex:
+    name: Publish to hex.pm
+    needs: publish_release
+    runs-on: ubuntu-22.04
+    env:
+      MIX_ENV: prod
+      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+
+      - name: Install hex / rebar
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+
+      - name: Download NIF artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksum file from real artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          OUT="checksum-Elixir.Javex.Native.exs"
+          {
+            echo "%{"
+            for f in artifacts/*.tar.gz; do
+              name="$(basename "$f")"
+              sum="$(sha256sum "$f" | cut -d' ' -f1)"
+              echo "  \"${name}\" => \"sha256:${sum}\","
+            done
+            echo "}"
+          } > "$OUT"
+          echo "--- ${OUT} ---"
+          cat "$OUT"
+
+      - name: Fetch deps
+        run: mix deps.get --only prod
+
+      - name: Publish to hex
+        run: mix hex.publish package --yes
