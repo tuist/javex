@@ -256,8 +256,8 @@ jobs:
       # Irreversible block — order is load-bearing.
       ##
 
-      - name: Publish to hex.pm
-        run: mix hex.publish package --yes
+      - name: Publish to hex.pm (package + docs)
+        run: mix hex.publish --yes
 
       - name: Configure git
         run: |
