@@ -39,35 +39,14 @@ Compile and run:
 
 ```elixir
 js = ~S"""
-function readInput() {
-  const chunks = [];
-  let total = 0;
-  while (true) {
-    const buf = new Uint8Array(1024);
-    const n = Javy.IO.readSync(0, buf);
-    if (n === 0) break;
-    total += n;
-    chunks.push(buf.subarray(0, n));
-  }
-  const out = new Uint8Array(total);
-  let o = 0;
-  for (const c of chunks) { out.set(c, o); o += c.length; }
-  return JSON.parse(new TextDecoder().decode(out));
-}
-
-function writeOutput(value) {
-  Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(value)));
-}
-
-const input = readInput();
-writeOutput({ sum: input.a + input.b });
+Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify({hello: "world"})));
 """
 
 {:ok, mod} = Javex.compile(js)
-{:ok, %{"sum" => 3}} = Javex.run(mod, %{a: 1, b: 2})
+{:ok, %{"hello" => "world"}} = Javex.run(mod, nil)
 ```
 
-> 💡 **Heads up:** Javy's runtime exposes `Javy.IO.readSync(fd, buf)` / `Javy.IO.writeSync(fd, buf)` rather than `readInput` / `writeOutput`. The boilerplate above is the convention from [Javy's README](https://github.com/bytecodealliance/javy#example) — drop it once at the top of your script and `readInput()` / `writeOutput(value)` work as you'd expect.
+> 💡 **Reading input** in your JS requires a small stdin helper — see [Javy's README](https://github.com/bytecodealliance/javy#example) for the canonical `readInput()` / `writeOutput()` snippet to drop at the top of your script.
 
 ## ⚙️ The bits you'll reach for
 
@@ -107,12 +86,6 @@ Errors come back as a tagged tuple, never a process exit:
 - `Javex.Runtime` owns one wasmtime `Engine` plus the preloaded plugin. The `Engine` is `Send + Sync`, so one runtime handles your whole BEAM. Spin up sibling runtimes when you need different resource tiers.
 - Every `run/3` creates a fresh wasmtime `Store` and instance — clean JS state per call, with no measurable cold-start cost because the provider is already alive.
 - The Rust NIF ships **precompiled** for macOS (Apple Silicon + Intel) and Linux (aarch64 + x86_64 GNU). No Rust toolchain required to install.
-
-## 🔭 Roadmap
-
-- 🪟 Windows + 🐧 musl precompiled NIFs (v0.2.0)
-- 📚 Hex docs + tutorial pages
-- 🪝 Pluggable host imports (let your JS call into Elixir functions)
 
 ## 📄 License
 
