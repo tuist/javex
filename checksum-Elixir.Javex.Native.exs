@@ -1,6 +1,6 @@
 %{
-  "libjavex_nif-v0.1.2-nif-2.16-aarch64-apple-darwin.so.tar.gz" => "sha256:552b547f139b0e7866e54309c97383651dd5cf20d92e28201fc99a0bb8a738dd",
-  "libjavex_nif-v0.1.2-nif-2.16-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:2f3dbb208fb163e552c38ca95ca83839dc1f9d5ef5e60872b2749c59387412c4",
-  "libjavex_nif-v0.1.2-nif-2.16-x86_64-apple-darwin.so.tar.gz" => "sha256:161440dd37f94cf2ae33ba51d27860e613b193c2dcd0b2679246e7df6738f72b",
-  "libjavex_nif-v0.1.2-nif-2.16-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:4491155b05c0245baec9b12bdc36f70663e11a2ef1c931e3e06dd0f01e0a81c7",
+  "libjavex_nif-v0.1.3-nif-2.16-aarch64-apple-darwin.so.tar.gz" => "sha256:70cc118e73d0281c487627cfa6025e93f3200bd0e05abdd9d3e3dbe2e9e5958e",
+  "libjavex_nif-v0.1.3-nif-2.16-aarch64-unknown-linux-gnu.so.tar.gz" => "sha256:84c9929a721592c2febd53ef974edff233e1373c5c4f491da5a7293194d97b44",
+  "libjavex_nif-v0.1.3-nif-2.16-x86_64-apple-darwin.so.tar.gz" => "sha256:ffc181357e549bc483e1b1026777c158080b89da9e3cb92ce860f554701e6ce4",
+  "libjavex_nif-v0.1.3-nif-2.16-x86_64-unknown-linux-gnu.so.tar.gz" => "sha256:c96f47d264ba153962d1d69d07df8a12ecd790dd146547a5c03a5d44090dffa9",
 }
