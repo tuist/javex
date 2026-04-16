@@ -2,24 +2,79 @@ name: Release
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Force a specific version (no v prefix). Leave empty to derive from commits."
+        required: false
 
 permissions:
   contents: write
 
 jobs:
+  decide:
+    name: Decide next version
+    runs-on: ubuntu-22.04
+    outputs:
+      release: ${{ steps.next.outputs.release }}
+      version: ${{ steps.next.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        shell: bash
+        run: |
+          set -euo pipefail
+          GC_VERSION="2.6.1"
+          URL="https://github.com/orhun/git-cliff/releases/download/v${GC_VERSION}/git-cliff-${GC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSL "$URL" -o /tmp/git-cliff.tar.gz
+          mkdir -p /tmp/git-cliff
+          tar -xzf /tmp/git-cliff.tar.gz -C /tmp/git-cliff --strip-components 1
+          sudo install /tmp/git-cliff/git-cliff /usr/local/bin/git-cliff
+
+      - name: Decide next version
+        id: next
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${{ inputs.version }}" ]]; then
+            VERSION="${{ inputs.version }}"
+            echo "Forced version via workflow_dispatch: ${VERSION}"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEXT="$(git-cliff --config cliff.toml --bumped-version 2>/dev/null || true)"
+          LATEST="$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+
+          echo "Latest tag:              ${LATEST:-(none)}"
+          echo "git-cliff bumped-version: ${NEXT:-(none)}"
+
+          if [[ -z "$NEXT" || "$NEXT" == "$LATEST" ]]; then
+            echo "No releasable commits since last tag; skipping."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            VERSION="${NEXT#v}"
+            echo "Will release ${NEXT}"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          fi
+
   build_nif:
     name: NIF ${{ matrix.job.target }}
+    needs: decide
+    if: needs.decide.outputs.release == 'true'
     runs-on: ${{ matrix.job.os }}
     strategy:
       fail-fast: false
       matrix:
         nif: ["2.16"]
         job:
-          # Both Apple targets build on the native Apple Silicon runner;
-          # x86_64-apple-darwin is a cross-compile from arm64 using the
-          # stock rustup target, which is fine because no C deps of the
-          # NIF need native compilation at that target.
           - { target: aarch64-apple-darwin,      os: macos-14,         lib-ext: dylib }
           - { target: x86_64-apple-darwin,       os: macos-14,         lib-ext: dylib }
           - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     lib-ext: so    }
@@ -35,16 +90,10 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.job.target }}
 
-      - name: Extract project version
-        id: version
-        shell: bash
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-
       - name: Compute NIF feature flag
         id: feature
         shell: bash
-        run: |
-          echo "flag=nif_version_$(echo ${{ matrix.nif }} | tr . _)" >> "$GITHUB_OUTPUT"
+        run: echo "flag=nif_version_$(echo ${{ matrix.nif }} | tr . _)" >> "$GITHUB_OUTPUT"
 
       - name: Build NIF
         shell: bash
@@ -60,7 +109,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ steps.version.outputs.version }}"
+          VERSION="${{ needs.decide.outputs.version }}"
           NIF="${{ matrix.nif }}"
           TARGET="${{ matrix.job.target }}"
           SRC_EXT="${{ matrix.job.lib-ext }}"
@@ -87,56 +136,25 @@ jobs:
           path: ${{ steps.package.outputs.archive }}
           if-no-files-found: error
 
-  publish_release:
-    name: Publish GitHub Release
-    needs: build_nif
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install git-cliff
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION="2.6.1"
-          URL="https://github.com/orhun/git-cliff/releases/download/v${VERSION}/git-cliff-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-          curl -sSL "$URL" -o /tmp/git-cliff.tar.gz
-          mkdir -p /tmp/git-cliff && tar -xzf /tmp/git-cliff.tar.gz -C /tmp/git-cliff --strip-components 1
-          sudo install /tmp/git-cliff/git-cliff /usr/local/bin/git-cliff
-          git-cliff --version
-
-      - name: Generate changelog
-        shell: bash
-        run: git-cliff --config cliff.toml --latest --strip header > CHANGES.md
-
-      - name: Download NIF artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: artifacts
-          merge-multiple: true
-
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: CHANGES.md
-          files: artifacts/*
-          fail_on_unmatched_files: true
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-
-  publish_hex:
-    name: Publish to hex.pm
-    needs: publish_release
+  release:
+    # Atomic by design: every reversible step happens first, then the
+    # three irreversible ones run back-to-back at the end:
+    #   1. mix hex.publish     (cannot unpublish after 24h)
+    #   2. git push --atomic   (commit + tag together)
+    #   3. GH release create   (cosmetic, easiest to recreate manually)
+    # If any step before #1 fails, nothing leaks.
+    name: Atomic publish (hex + commit + tag + GH release)
+    needs: [decide, build_nif]
+    if: needs.decide.outputs.release == 'true'
     runs-on: ubuntu-22.04
     env:
+      VERSION: ${{ needs.decide.outputs.version }}
       MIX_ENV: prod
       HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: jdx/mise-action@v2
         with:
@@ -147,11 +165,30 @@ jobs:
           mix local.hex --force
           mix local.rebar --force
 
+      - name: Install git-cliff
+        shell: bash
+        run: |
+          set -euo pipefail
+          GC_VERSION="2.6.1"
+          URL="https://github.com/orhun/git-cliff/releases/download/v${GC_VERSION}/git-cliff-${GC_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSL "$URL" -o /tmp/git-cliff.tar.gz
+          mkdir -p /tmp/git-cliff
+          tar -xzf /tmp/git-cliff.tar.gz -C /tmp/git-cliff --strip-components 1
+          sudo install /tmp/git-cliff/git-cliff /usr/local/bin/git-cliff
+
       - name: Download NIF artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Bump @version in mix.exs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i.bak -E "s/^(  @version )\".*\"/\\1\"${VERSION}\"/" mix.exs
+          rm mix.exs.bak
+          grep '@version' mix.exs
 
       - name: Generate checksum file from real artifacts
         shell: bash
@@ -167,11 +204,69 @@ jobs:
             done
             echo "}"
           } > "$OUT"
-          echo "--- ${OUT} ---"
-          cat "$OUT"
+
+      - name: Pre-seed rustler_precompiled cache for host
+        # Stops the upcoming `mix hex.publish` compile step from trying
+        # to download the linux-gnu NIF from a GitHub release that does
+        # not exist yet (we create it after publishing to hex).
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.cache/rustler_precompiled/precompiled_nifs"
+          cp "artifacts/libjavex_nif-v${VERSION}-nif-2.16-x86_64-unknown-linux-gnu.so.tar.gz" \
+             "$HOME/.cache/rustler_precompiled/precompiled_nifs/"
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          git-cliff --config cliff.toml --bump --latest --strip header > CHANGES.md
+          echo "--- CHANGES.md ---"
+          cat CHANGES.md
 
       - name: Fetch deps
         run: mix deps.get --only prod
 
-      - name: Publish to hex
+      ##
+      # Irreversible block — order is load-bearing.
+      ##
+
+      - name: Publish to hex.pm
         run: mix hex.publish package --yes
+
+      - name: Configure git
+        run: |
+          git config user.name  "tuistbot"
+          git config user.email "noreply@tuist.dev"
+
+      - name: Commit version bump and tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add mix.exs checksum-Elixir.Javex.Native.exs
+          git commit -m "chore(release): v${VERSION}"
+          git tag "v${VERSION}"
+
+      - name: Push commit and tag atomically
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            if git push --atomic origin main "v${VERSION}"; then
+              exit 0
+            fi
+            echo "Push attempt ${attempt} failed; rebasing and retrying"
+            git pull --rebase origin main
+          done
+          echo "git push --atomic failed after 3 attempts" >&2
+          exit 1
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGES.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          tag_name: v${{ env.VERSION }}
+          name: v${{ env.VERSION }}
+          draft: false
+          prerelease: false
