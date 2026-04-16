@@ -75,8 +75,26 @@ split_commits = false
 commit_preprocessors = [
     { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "" },
 ]
+# Only feat / fix / perf / refactor commits are release-worthy. Anything
+# else (chore, ci, docs, test, style, build) is filtered out so that
+# git-cliff's --bumped-version returns the current version when nothing
+# user-visible changed, and the workflow's decide job correctly skips
+# the release.
+commit_parsers = [
+    { message = "^feat",     group = "Features" },
+    { message = "^fix",      group = "Bug Fixes" },
+    { message = "^perf",     group = "Performance" },
+    { message = "^refactor", group = "Refactor" },
+    { message = "^chore",    skip  = true },
+    { message = "^ci",       skip  = true },
+    { message = "^docs?",    skip  = true },
+    { message = "^test",     skip  = true },
+    { message = "^style",    skip  = true },
+    { message = "^build",    skip  = true },
+    { message = ".*",        skip  = true },
+]
 protect_breaking_commits = false
-filter_commits = false
+filter_commits = true
 tag_pattern = "v[0-9].*"
 skip_tags = "beta|alpha"
 ignore_tags = "rc"

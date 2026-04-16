@@ -49,21 +49,47 @@ jobs:
             exit 0
           fi
 
-          NEXT="$(git-cliff --config cliff.toml --bumped-version 2>/dev/null || true)"
+          # Capture both stdout (the version string) and stderr (where
+          # git-cliff says "There is nothing to bump") in one go.
+          GC_OUT="$(git-cliff --config cliff.toml --bumped-version 2>&1 || true)"
+          NEXT="$(printf '%s\n' "$GC_OUT" | tail -n1)"
           LATEST="$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
 
-          echo "Latest tag:              ${LATEST:-(none)}"
+          echo "Latest tag:               ${LATEST:-(none)}"
           echo "git-cliff bumped-version: ${NEXT:-(none)}"
 
-          if [[ -z "$NEXT" || "$NEXT" == "$LATEST" ]]; then
-            echo "No releasable commits since last tag; skipping."
+          # Three reasons to skip:
+          #   (a) git-cliff explicitly said nothing bumps;
+          #   (b) git-cliff returned the same string as the latest tag;
+          #   (c) git-cliff returned a version <= the latest tag (it
+          #       can do this when the "latest" tag points at a commit
+          #       whose only contents are filtered, e.g. our own
+          #       chore(release): bump commit).
+          if printf '%s\n' "$GC_OUT" | grep -q "nothing to bump"; then
+            echo "git-cliff: nothing to bump; skipping release."
             echo "release=false" >> "$GITHUB_OUTPUT"
-          else
-            VERSION="${NEXT#v}"
-            echo "Will release ${NEXT}"
-            echo "release=true" >> "$GITHUB_OUTPUT"
-            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          if [[ -z "$NEXT" || "$NEXT" == "$LATEST" ]]; then
+            echo "No new version proposed; skipping release."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ -n "$LATEST" ]]; then
+            HIGHEST="$(printf '%s\n%s\n' "$LATEST" "$NEXT" | sort -V | tail -n1)"
+            if [[ "$HIGHEST" == "$LATEST" ]]; then
+              echo "Proposed ${NEXT} is not greater than ${LATEST}; skipping release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          VERSION="${NEXT#v}"
+          echo "Will release ${NEXT}"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
   build_nif:
     name: NIF ${{ matrix.job.target }}
