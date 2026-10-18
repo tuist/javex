@@ -13,7 +13,7 @@ defmodule Javex.Module do
   `:erlang.term_to_binary/1` round-trips the struct with zero ceremony.
   """
 
-  alias Javex.{CompileError, Native}
+  alias Javex.{CompileError, Native, Options}
 
   @type mode :: :dynamic | :static
 
@@ -29,25 +29,95 @@ defmodule Javex.Module do
   @doc false
   @spec compile(String.t(), keyword()) :: {:ok, t()} | {:error, CompileError.t()}
   def compile(source, opts) do
-    mode = Keyword.get(opts, :mode, :dynamic)
-    plugin = plugin_for(mode, opts)
+    with {:ok, limits} <- Options.compile(opts),
+         :ok <- source_size(source, limits.max_input) do
+      mode = Keyword.get(opts, :mode, :dynamic)
 
-    case Native.compile(plugin, source, mode) do
-      {:ok, {bytes, provider_hash}} ->
-        {:ok, %__MODULE__{bytes: bytes, mode: mode, provider_hash: provider_hash}}
+      result =
+        if runtime = Keyword.get(opts, :runtime) do
+          Javex.Runtime.compile(runtime, source, mode, opts, limits)
+        else
+          compile_with_deadline(source, mode, opts, limits)
+        end
 
-      {:error, reason} ->
-        {:error, %CompileError{message: to_string(reason)}}
+      case result do
+        {:ok, {bytes, provider_hash}} ->
+          {:ok,
+           %__MODULE__{
+             bytes: bytes,
+             mode: mode,
+             provider_hash: if(mode == :dynamic, do: provider_hash)
+           }}
+
+        {:error, reason} ->
+          compile_error(reason)
+      end
+    else
+      {:error, reason} -> compile_error(reason)
     end
   end
 
-  defp plugin_for(:static, _opts), do: <<>>
+  defp source_size(source, max) do
+    if byte_size(source) <= max, do: :ok, else: {:error, "source limit exceeded"}
+  end
 
-  defp plugin_for(:dynamic, opts) do
-    cond do
-      bytes = Keyword.get(opts, :plugin) -> bytes
-      runtime = Keyword.get(opts, :runtime) -> Javex.Runtime.plugin_bytes(runtime)
-      true -> Javex.Plugin.bytes!()
+  defp compile_with_deadline(source, mode, opts, limits) do
+    caller = self()
+    reply = :erlang.alias()
+
+    {guardian, monitor} =
+      spawn_monitor(fn ->
+        caller_monitor = Process.monitor(caller)
+        control = Native.control_new(limits.timeout)
+        guardian = self()
+
+        {worker, worker_monitor} =
+          spawn_monitor(fn ->
+            result =
+              try do
+                Native.compile(
+                  Keyword.get(opts, :plugin) || Javex.Plugin.bytes!(),
+                  source,
+                  mode,
+                  Options.native(limits, mode),
+                  control
+                )
+              rescue
+                error -> {:error, Exception.message(error)}
+              end
+
+            send(guardian, {:compiled, result})
+          end)
+
+        receive do
+          {:compiled, result} ->
+            send(reply, {reply, result})
+
+          {:DOWN, ^caller_monitor, :process, _, _} ->
+            :ok
+
+          {:DOWN, ^worker_monitor, :process, _, _} ->
+            send(reply, {reply, {:error, "compiler worker stopped"}})
+        after
+          limits.timeout -> send(reply, {reply, {:error, "compilation timed out"}})
+        end
+
+        Native.cancel(control)
+        Process.exit(worker, :kill)
+      end)
+
+    try do
+      receive do
+        {^reply, result} -> result
+        {:DOWN, ^monitor, :process, ^guardian, _} -> {:error, "compiler coordinator stopped"}
+      end
+    after
+      :erlang.unalias(reply)
+      Process.demonitor(monitor, [:flush])
     end
   end
+
+  defp compile_error(%_{} = error), do: {:error, %CompileError{message: Exception.message(error)}}
+  defp compile_error({_kind, message}), do: compile_error(message)
+  defp compile_error(message), do: {:error, %CompileError{message: to_string(message)}}
 end

@@ -13,6 +13,7 @@ defmodule Javex.Native do
   use RustlerPrecompiled,
     otp_app: :javex,
     crate: "javex_nif",
+    binaries: ["javex_worker"],
     base_url: "https://github.com/tuist/javex/releases/download/v#{version}",
     force_build: System.get_env("JAVEX_BUILD") in ["1", "true"],
     version: version,
@@ -24,10 +25,12 @@ defmodule Javex.Native do
       x86_64-unknown-linux-gnu
     )
 
-  def compile(_plugin, _source, _mode), do: err()
-  def runtime_new(_plugin), do: err()
-  def module_precompile(_runtime, _wasm_bytes), do: err()
-  def run(_runtime, _precompiled, _input, _opts), do: err()
+  def compile(_plugin, _source, _mode, _opts, _control), do: err()
+  def runtime_new(_plugin, _limits), do: err()
+  def runtime_stats(_runtime), do: err()
+  def control_new(_timeout_ms), do: err()
+  def cancel(_control), do: err()
+  def run(_runtime, _wasm, _input, _opts, _control), do: err()
 
   defp err, do: :erlang.nif_error(:nif_not_loaded)
 end

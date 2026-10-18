@@ -1,23 +1,28 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
+  # Main pushes run this workflow through Release, so verification is
+  # required for publishing without compiling and testing twice.
+  workflow_call:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
   MIX_ENV: test
   JAVEX_BUILD: "1"
+  CARGO_BUILD_JOBS: "1"
 
 jobs:
   lint:
-    name: Lint (Quokka + Credo)
-    runs-on: ubuntu-22.04
+    name: Lint (Quokka + Credo + Rust)
+    runs-on: tuist-linux
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -25,11 +30,10 @@ jobs:
           experimental: true
       - uses: actions/cache@v4
         with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-
+          # Never restore BEAMs or NIFs compiled for older library code.
+          path: deps
+          key: ${{ runner.os }}-mix-deps-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-deps-
       - uses: actions/cache@v4
         with:
           path: |
@@ -43,10 +47,34 @@ jobs:
         run: mix format --check-formatted
       - name: Credo (strict)
         run: mix credo --strict
+      - name: Rust formatting and clippy
+        working-directory: native/javex_nif
+        run: |
+          rustup component add rustfmt clippy
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets --no-default-features --features nif_version_2_16 -- -D warnings
+
+  advisories:
+    name: Dependency advisories (Hex + RustSec)
+    runs-on: tuist-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+      - name: Audit Hex dependencies
+        run: |
+          mix local.hex --force
+          mix deps.get
+          mix hex.audit
+      - name: Audit Rust dependencies
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --file native/javex_nif/Cargo.lock
 
   compile:
     name: Compile without warnings
-    runs-on: ubuntu-22.04
+    runs-on: tuist-linux
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -54,11 +82,9 @@ jobs:
           experimental: true
       - uses: actions/cache@v4
         with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-
+          path: deps
+          key: ${{ runner.os }}-mix-deps-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-deps-
       - uses: actions/cache@v4
         with:
           path: |
@@ -72,7 +98,7 @@ jobs:
 
   test:
     name: Test
-    runs-on: ubuntu-22.04
+    runs-on: tuist-linux
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
@@ -80,11 +106,9 @@ jobs:
           experimental: true
       - uses: actions/cache@v4
         with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('**/mix.lock') }}
-          restore-keys: ${{ runner.os }}-mix-
+          path: deps
+          key: ${{ runner.os }}-mix-deps-${{ hashFiles('**/mix.lock') }}
+          restore-keys: ${{ runner.os }}-mix-deps-
       - uses: actions/cache@v4
         with:
           path: |
@@ -94,4 +118,7 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('native/javex_nif/Cargo.toml', 'native/javex_nif/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
       - run: mix deps.get
-      - run: mix test
+      - name: Native contract tests
+        working-directory: native/javex_nif
+        run: cargo test --release --locked --no-default-features --features nif_version_2_16
+      - run: mix test --cover

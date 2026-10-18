@@ -10,12 +10,22 @@ on:
         required: false
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  verify:
+    name: Verify release commit
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/ci.yml
+
   decide:
     name: Decide next version
-    runs-on: ubuntu-22.04
+    needs: verify
+    runs-on: tuist-linux
     outputs:
       release: ${{ steps.next.outputs.release }}
       version: ${{ steps.next.outputs.version }}
@@ -38,11 +48,19 @@ jobs:
       - name: Decide next version
         id: next
         shell: bash
+        env:
+          FORCED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
 
-          if [[ -n "${{ inputs.version }}" ]]; then
-            VERSION="${{ inputs.version }}"
+          if [[ -n "$FORCED_VERSION" ]]; then
+            # Pre-release versions force RustlerPrecompiled to build from
+            # source, so only stable SemVer versions can be published here.
+            if [[ ! "$FORCED_VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              echo "Expected a stable SemVer version without a v prefix" >&2
+              exit 1
+            fi
+            VERSION="$FORCED_VERSION"
             echo "Forced version via workflow_dispatch: ${VERSION}"
             echo "release=true" >> "$GITHUB_OUTPUT"
             echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -51,7 +69,10 @@ jobs:
 
           # Capture both stdout (the version string) and stderr (where
           # git-cliff says "There is nothing to bump") in one go.
-          GC_OUT="$(git-cliff --config cliff.toml --bumped-version 2>&1 || true)"
+          if ! GC_OUT="$(git-cliff --config cliff.toml --bumped-version 2>&1)"; then
+            printf '%s\n' "$GC_OUT" >&2
+            exit 1
+          fi
           NEXT="$(printf '%s\n' "$GC_OUT" | tail -n1)"
           LATEST="$(git tag --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
 
@@ -77,6 +98,14 @@ jobs:
             exit 0
           fi
 
+          # Never pass arbitrary CLI output into later shell commands or
+          # artifact names, even when git-cliff exits successfully.
+          if [[ ! "$NEXT" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "git-cliff did not return a stable SemVer version" >&2
+            exit 1
+          fi
+          NEXT="v${NEXT#v}"
+
           if [[ -n "$LATEST" ]]; then
             HIGHEST="$(printf '%s\n%s\n' "$LATEST" "$NEXT" | sort -V | tail -n1)"
             if [[ "$HIGHEST" == "$LATEST" ]]; then
@@ -101,19 +130,32 @@ jobs:
       matrix:
         nif: ["2.16"]
         job:
-          - { target: aarch64-apple-darwin,      os: macos-14,         lib-ext: dylib }
-          - { target: x86_64-apple-darwin,       os: macos-14,         lib-ext: dylib }
-          - { target: x86_64-unknown-linux-gnu,  os: ubuntu-22.04,     lib-ext: so    }
+          - { target: aarch64-apple-darwin,      os: tuist-macos,      lib-ext: dylib }
+          # Tuist's fleet has no native Intel macOS or ARM Linux pool.
+          # Keep native execution on these two hosted runners.
+          - { target: x86_64-apple-darwin,       os: macos-15-intel,   lib-ext: dylib }
+          - { target: x86_64-unknown-linux-gnu,  os: tuist-linux,      lib-ext: so    }
           - { target: aarch64-unknown-linux-gnu, os: ubuntu-22.04-arm, lib-ext: so    }
+
+    env:
+      MIX_ENV: test
+      JAVEX_BUILD: "0"
+      CARGO_BUILD_JOBS: "1"
+      RUSTLER_PRECOMPILED_FORCE_BUILD_ALL: "false"
+      RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+
+      - name: Verify native build architecture
         shell: bash
         run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
+          set -euo pipefail
+          test "$(rustc -vV | sed -n 's/^host: //p')" = "${{ matrix.job.target }}"
           rustup target add ${{ matrix.job.target }}
 
       - name: Compute NIF feature flag
@@ -125,7 +167,7 @@ jobs:
         shell: bash
         working-directory: native/javex_nif
         run: |
-          cargo build --release \
+          cargo build --locked --release \
             --target ${{ matrix.job.target }} \
             --no-default-features \
             --features ${{ steps.feature.outputs.flag }}
@@ -150,10 +192,42 @@ jobs:
           SRC="native/javex_nif/target/${TARGET}/release/libjavex_nif.${SRC_EXT}"
           STAGE="$(mktemp -d)"
           cp "${SRC}" "${STAGE}/${NAME}.so"
-          tar -C "${STAGE}" -czf "${ARCHIVE}" "${NAME}.so"
+          cp "native/javex_nif/target/${TARGET}/release/javex_worker" "${STAGE}/javex_worker"
+          chmod 755 "${STAGE}/javex_worker"
+          tar -C "${STAGE}" -czf "${ARCHIVE}" "${NAME}.so" javex_worker
 
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
           echo "name=${ARCHIVE}" >> "$GITHUB_OUTPUT"
+
+      - name: Test packaged NIF with current library
+        shell: bash
+        env:
+          VERSION: ${{ needs.decide.outputs.version }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          set -euo pipefail
+          sed -i.bak -E "s/^(  @version )\".*\"/\\1\"${VERSION}\"/" mix.exs
+          rm mix.exs.bak
+
+          # Compile from a clean tree with only this job's new archive in
+          # cache; never download the previous release or rebuild locally.
+          rm -rf _build priv/native "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH"
+          mkdir -p priv/native "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH"
+          cp "$ARCHIVE" "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/"
+          SUM="$(shasum -a 256 "$ARCHIVE" | cut -d' ' -f1)"
+          printf '%%{\n  "%s" => "sha256:%s"\n}\n' "$ARCHIVE" "$SUM" \
+            > checksum-Elixir.Javex.Native.exs
+
+          mix deps.get
+          mix test
+
+          # A source-built NIF has a different name. Require the exact
+          # packaged target library to have been extracted for this VM.
+          cmp "native/javex_nif/target/${{ matrix.job.target }}/release/libjavex_nif.${{ matrix.job.lib-ext }}" \
+            "_build/test/lib/javex/priv/native/${ARCHIVE%.tar.gz}"
+          cmp "native/javex_nif/target/${{ matrix.job.target }}/release/javex_worker" \
+            "_build/test/lib/javex/priv/native/javex_worker"
+          test -x _build/test/lib/javex/priv/native/javex_worker
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -163,20 +237,24 @@ jobs:
           if-no-files-found: error
 
   release:
-    # Atomic by design: every reversible step happens first, then the
-    # three irreversible ones run back-to-back at the end:
+    # Publishing across Hex, Git and GitHub is not transactional. Complete
+    # verification and preparation before the irreversible steps:
     #   1. mix hex.publish     (cannot unpublish after 24h)
     #   2. git push --atomic   (commit + tag together)
     #   3. GH release create   (cosmetic, easiest to recreate manually)
-    # If any step before #1 fails, nothing leaks.
-    name: Atomic publish (hex + commit + tag + GH release)
-    needs: [decide, build_nif]
+    # Never rebase the release onto code that was not verified above.
+    name: Publish verified release (hex + commit + tag + GH release)
+    needs: [verify, decide, build_nif]
     if: needs.decide.outputs.release == 'true'
-    runs-on: ubuntu-22.04
+    runs-on: tuist-linux
+    permissions:
+      contents: write
     env:
       VERSION: ${{ needs.decide.outputs.version }}
       MIX_ENV: prod
-      HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
+      JAVEX_BUILD: "0"
+      RUSTLER_PRECOMPILED_FORCE_BUILD_ALL: "false"
+      RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -205,6 +283,7 @@ jobs:
       - name: Download NIF artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: libjavex_nif-v${{ env.VERSION }}-nif-2.16-*.so.tar.gz
           path: artifacts
           merge-multiple: true
 
@@ -238,25 +317,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.cache/rustler_precompiled/precompiled_nifs"
+          mkdir -p priv/native "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH"
           cp "artifacts/libjavex_nif-v${VERSION}-nif-2.16-x86_64-unknown-linux-gnu.so.tar.gz" \
-             "$HOME/.cache/rustler_precompiled/precompiled_nifs/"
+             "$RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH/"
 
       - name: Generate release notes
         shell: bash
         run: |
-          git-cliff --config cliff.toml --bump --latest --strip header > CHANGES.md
+          git-cliff --config cliff.toml --tag "v${VERSION}" --unreleased --strip header > CHANGES.md
           echo "--- CHANGES.md ---"
           cat CHANGES.md
 
       - name: Fetch deps
         run: mix deps.get --only prod
 
+      - name: Validate package and docs before publishing
+        run: |
+          mix compile --warnings-as-errors
+          mix hex.build
+          mix docs --warnings-as-errors
+
+      - name: Require main to still match the verified commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [[ "$(git rev-parse origin/main)" != "$GITHUB_SHA" ]]; then
+            echo "Main advanced since verification; a newer run must release it." >&2
+            exit 1
+          fi
+          # Check the remote too: checkout may predate a tag created while
+          # the builds ran. A failed remote lookup must fail closed.
+          REMOTE_TAG="$(git ls-remote --tags origin "refs/tags/v${VERSION}")"
+          if [[ -n "$REMOTE_TAG" ]] || git show-ref --verify --quiet "refs/tags/v${VERSION}"; then
+            echo "Version v${VERSION} already exists." >&2
+            exit 1
+          fi
+
       ##
       # Irreversible block — order is load-bearing.
       ##
 
       - name: Publish to hex.pm (package + docs)
+        env:
+          HEX_API_KEY: ${{ secrets.HEX_API_KEY }}
         run: mix hex.publish --yes
 
       - name: Configure git
@@ -276,15 +381,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for attempt in 1 2 3; do
-            if git push --atomic origin main "v${VERSION}"; then
-              exit 0
-            fi
-            echo "Push attempt ${attempt} failed; rebasing and retrying"
-            git pull --rebase origin main
-          done
-          echo "git push --atomic failed after 3 attempts" >&2
-          exit 1
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/v${VERSION}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

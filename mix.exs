@@ -14,6 +14,9 @@ defmodule Javex.MixProject do
       description: description(),
       package: package(),
       source_url: @source_url,
+      # NIF replacements do not execute their Elixir fallback bodies.
+      # Rust contracts run separately with cargo test.
+      test_coverage: [ignore_modules: [Javex.Native]],
       docs: docs()
     ]
   end
