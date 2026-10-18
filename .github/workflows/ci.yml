@@ -17,6 +17,7 @@ concurrency:
 env:
   MIX_ENV: test
   JAVEX_BUILD: "1"
+  CARGO_BUILD_JOBS: "1"
 
 jobs:
   lint:
@@ -120,4 +121,4 @@ jobs:
       - name: Native contract tests
         working-directory: native/javex_nif
         run: cargo test --release --locked --no-default-features --features nif_version_2_16
-      - run: mix test
+      - run: mix test --cover

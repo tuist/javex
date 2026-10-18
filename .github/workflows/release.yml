@@ -140,6 +140,7 @@ jobs:
     env:
       MIX_ENV: test
       JAVEX_BUILD: "0"
+      CARGO_BUILD_JOBS: "1"
       RUSTLER_PRECOMPILED_FORCE_BUILD_ALL: "false"
       RUSTLER_PRECOMPILED_GLOBAL_CACHE_PATH: ${{ github.workspace }}/.nif-cache
 
@@ -191,7 +192,9 @@ jobs:
           SRC="native/javex_nif/target/${TARGET}/release/libjavex_nif.${SRC_EXT}"
           STAGE="$(mktemp -d)"
           cp "${SRC}" "${STAGE}/${NAME}.so"
-          tar -C "${STAGE}" -czf "${ARCHIVE}" "${NAME}.so"
+          cp "native/javex_nif/target/${TARGET}/release/javex_worker" "${STAGE}/javex_worker"
+          chmod 755 "${STAGE}/javex_worker"
+          tar -C "${STAGE}" -czf "${ARCHIVE}" "${NAME}.so" javex_worker
 
           echo "archive=${ARCHIVE}" >> "$GITHUB_OUTPUT"
           echo "name=${ARCHIVE}" >> "$GITHUB_OUTPUT"
@@ -222,6 +225,9 @@ jobs:
           # packaged target library to have been extracted for this VM.
           cmp "native/javex_nif/target/${{ matrix.job.target }}/release/libjavex_nif.${{ matrix.job.lib-ext }}" \
             "_build/test/lib/javex/priv/native/${ARCHIVE%.tar.gz}"
+          cmp "native/javex_nif/target/${{ matrix.job.target }}/release/javex_worker" \
+            "_build/test/lib/javex/priv/native/javex_worker"
+          test -x _build/test/lib/javex/priv/native/javex_worker
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

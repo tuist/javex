@@ -1,5 +1,4 @@
 [tools]
 erlang = "28.4.2"
 elixir = "1.19.5-otp-28"
-rust = "1.94.1"
-
+rust = "1.96.0"

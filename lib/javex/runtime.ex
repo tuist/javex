@@ -1,49 +1,38 @@
 defmodule Javex.Runtime do
   @moduledoc """
-  A wasmtime runtime with the Javy provider plugin preloaded.
+  Owns a compiled provider and a bounded native-module cache. Each execution
+  uses a fresh store and provider instance on a monitored worker, so the server
+  remains responsive while JavaScript runs.
 
-  Starting a runtime is the consumer's responsibility. Add one to your
-  application's supervision tree:
+  Add `Javex.Runtime` to your supervision tree. Use `:name` and `runtime: name`
+  for multiple runtimes. Options named `:default_timeout`, `:default_fuel`,
+  `:default_max_memory`, `:default_max_input`, `:default_max_output`,
+  `:default_max_stderr`, and `:default_max_module` supply the defaults documented
+  by `Javex.run/3`. These are defaults, not authorization ceilings; only trusted
+  host code should choose options.
 
-      children = [
-        Javex.Runtime
-      ]
+  `:max_concurrency` defaults to 4. Saturation returns `:busy` rather than
+  accumulating an unbounded queue. Calls cancelled or timed out retain their
+  slot until native work actually stops. `:max_cached_modules` defaults to 64
+  and `:max_cache_bytes` to 64 MiB of compiled images; zero disables caching.
 
-  or with custom resource limits:
+  `:backend` defaults to `:in_process`. For untrusted code on Linux, select
+  `:isolated`: compilation with `runtime: name` and execution run in disposable
+  OS-restricted workers. `:max_process_memory` caps each execution child's
+  address space (default 512 MiB), including native parsing and JIT allocations.
+  Workers are killed and reaped on cancellation or deadline. There is no
+  cross-call native cache in this mode. It requires Linux with `close_range`
+  and seccomp TSYNC; unavailable protections fail closed, never fall back.
+  Compilations using this runtime share its admission capacity with executions.
 
-      children = [
-        {Javex.Runtime, default_fuel: 1_000_000, default_max_memory: 8 * 1024 * 1024}
-      ]
-
-  The default registered name is `Javex.Runtime`, which is also the
-  default `:runtime` `Javex.run/3` looks for. Multiple runtimes with
-  different tiers can coexist — pass `:name` to give them distinct
-  registered names and `runtime: name` on each `run/3` call.
-
-  A runtime owns a wasmtime `Engine`, an instantiated provider plugin,
-  and a cache of precompiled user modules (indexed by content hash).
+  `:plugin_path` selects a trusted, initialized Javy provider instead of the
+  bundled provider. Compile against it with `Javex.compile(js, runtime: name)`.
   """
 
   use GenServer
 
-  alias Javex.{IncompatibleProviderError, Module, Native, Plugin, RuntimeError}
+  alias Javex.{IncompatibleProviderError, Isolated, Module, Native, Options, Plugin, RuntimeError}
 
-  ## Public API
-
-  @doc """
-  Start a runtime.
-
-  ## Options
-
-    * `:name` - registered name. Defaults to `Javex.Runtime`.
-    * `:plugin_path` - override the bundled Javy plugin. Advanced — only
-      needed to link against a non-bundled provider.
-    * `:default_fuel` - fuel budget used by `run/4` when the caller does
-      not specify one.
-    * `:default_max_memory` - memory cap in bytes.
-    * `:default_timeout` - wall-clock timeout in milliseconds. Default
-      `5_000`.
-  """
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
     GenServer.start_link(__MODULE__, opts, name: name)
@@ -51,138 +40,250 @@ defmodule Javex.Runtime do
 
   @doc false
   def run(server, %Module{} = mod, input, opts) do
-    # The NIF enforces the wall-clock deadline via epoch interruption,
-    # using the runtime's `default_timeout` when the caller omits
-    # `:timeout`. The GenServer.call deadline must therefore simply be
-    # larger than whatever the NIF will honour, so we pass `:infinity`
-    # and let the NIF be the single source of truth.
-    GenServer.call(server, {:run, mod, input, opts}, :infinity)
+    GenServer.call(server, {:run, mod, input, opts, now()}, :infinity)
+  catch
+    :exit, _reason -> error(:runtime_down, "runtime is not available")
   end
 
-  @doc """
-  Return the bytes of the Javy provider plugin this runtime was built
-  with.
-
-  Used by `Javex.compile/2` so that a module compiled against a runtime
-  with a custom `:plugin_path` is linked against exactly the provider
-  that runtime hosts, instead of silently defaulting to the bundled
-  plugin.
-  """
-  @spec plugin_bytes(GenServer.server()) :: binary()
-  def plugin_bytes(server \\ __MODULE__) do
-    GenServer.call(server, :plugin_bytes)
+  @doc false
+  def compile(server, source, mode, opts, limits) do
+    GenServer.call(server, {:compile, source, mode, opts, limits, now()}, :infinity)
+  catch
+    :exit, _reason -> error(:runtime_down, "compiler runtime is not available")
   end
 
-  ## GenServer
+  @doc "Returns the trusted provider bytes used by this runtime."
+  def plugin_bytes(server \\ __MODULE__), do: GenServer.call(server, :plugin_bytes)
+
+  @doc "Returns active execution count and bounded compiled-image cache statistics."
+  def stats(server \\ __MODULE__), do: GenServer.call(server, :stats)
 
   @impl true
   def init(opts) do
-    plugin_path = Keyword.get(opts, :plugin_path, Plugin.path())
-
-    with {:ok, plugin} <- File.read(plugin_path),
-         {:ok, native} <- Native.runtime_new(plugin) do
-      state = %{
-        native: native,
-        plugin: plugin,
-        plugin_hash: :crypto.hash(:sha256, plugin),
-        precompiled: %{},
-        default_fuel: Keyword.get(opts, :default_fuel),
-        default_max_memory: Keyword.get(opts, :default_max_memory),
-        default_timeout: Keyword.get(opts, :default_timeout, 5_000)
-      }
-
-      {:ok, state}
+    with {:ok, defaults} <- Options.runtime(opts),
+         {:ok, plugin} <- File.read(Keyword.get(opts, :plugin_path, Plugin.path())),
+         backend = Keyword.get(opts, :backend, :in_process),
+         {:ok, native} <- new_native(backend, plugin, opts) do
+      {:ok,
+       %{
+         native: native,
+         backend: backend,
+         max_process_memory: Keyword.get(opts, :max_process_memory, 512 * 1024 * 1024),
+         plugin: plugin,
+         plugin_hash: :crypto.hash(:sha256, plugin),
+         defaults: defaults,
+         max_concurrency: Keyword.get(opts, :max_concurrency, 4),
+         jobs: %{}
+       }}
     else
       {:error, reason} -> {:stop, {:plugin_load_failed, reason}}
     end
   end
 
   @impl true
-  def handle_call(:plugin_bytes, _from, state) do
-    {:reply, state.plugin, state}
+  def handle_call(:plugin_bytes, _from, state), do: {:reply, state.plugin, state}
+
+  def handle_call(:stats, _from, state) do
+    cache =
+      if state.backend == :isolated,
+        do: %{cached_modules: 0, cache_bytes: 0, cache_hits: 0},
+        else: Native.runtime_stats(state.native)
+
+    {:reply, Map.put(cache, :running, map_size(state.jobs)), state}
+  end
+
+  def handle_call({:run, mod, input, opts, started}, from, state) do
+    with {:ok, limits} <- Options.run(opts, state.defaults),
+         :ok <- check_module(mod, state, limits) do
+      start_job(from, started, limits.timeout, state, fn control, server, remaining ->
+        execute(state, mod, input, %{limits | timeout: remaining}, control, server)
+      end)
+    else
+      {:error, _} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:compile, source, mode, opts, limits, started}, from, state) do
+    start_job(from, started, limits.timeout, state, fn control, server, remaining ->
+      plugin = Keyword.get(opts, :plugin) || state.plugin
+      limits = %{limits | timeout: remaining}
+
+      case state.backend do
+        :isolated ->
+          Isolated.compile(plugin, source, mode, limits, state.max_process_memory, server)
+
+        :in_process ->
+          Native.compile(plugin, source, mode, Options.native(limits, mode), control)
+      end
+    end)
   end
 
   @impl true
-  def handle_call({:run, mod, input, opts}, _from, state) do
-    with :ok <- check_provider(mod, state),
-         {:ok, precompiled, state} <- fetch_or_precompile(mod, state),
-         {:ok, raw_input} <- encode_input(input, opts),
-         native_opts = build_opts(opts, state),
-         {:ok, raw_output} <- Native.run(state.native, precompiled, raw_input, native_opts),
-         {:ok, decoded} <- decode_output(raw_output, opts) do
-      {:reply, {:ok, decoded}, state}
-    else
-      {:error, %_{} = err} -> {:reply, {:error, err}, state}
-      {:error, reason} -> {:reply, {:error, translate(reason)}, state}
+  def handle_info({:result, pid, result}, state) do
+    case Map.pop(state.jobs, pid) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {job, jobs} ->
+        cleanup(job)
+
+        result =
+          if now() >= job.deadline, do: error(:timeout, "execution timed out"), else: result
+
+        if job.from, do: GenServer.reply(job.from, result)
+        {:noreply, %{state | jobs: jobs}}
     end
   end
 
-  ## Helpers
-
-  defp check_provider(%Module{mode: :static}, _state), do: :ok
-
-  defp check_provider(%Module{mode: :dynamic, provider_hash: hash}, %{plugin_hash: hash}), do: :ok
-
-  defp check_provider(%Module{mode: :dynamic, provider_hash: got}, %{plugin_hash: expected}) do
-    {:error,
-     %IncompatibleProviderError{
-       expected: expected,
-       got: got
-     }}
-  end
-
-  defp fetch_or_precompile(%Module{bytes: bytes} = mod, state) do
-    key = :crypto.hash(:sha256, bytes)
-
-    case Map.fetch(state.precompiled, key) do
-      {:ok, precompiled} ->
-        {:ok, precompiled, state}
+  def handle_info({:timeout, pid}, state) do
+    case Map.fetch(state.jobs, pid) do
+      {:ok, job} ->
+        cancel(pid, job)
+        if job.from, do: GenServer.reply(job.from, error(:timeout, "execution timed out"))
+        {:noreply, put_in(state.jobs[pid].from, nil)}
 
       :error ->
-        case Native.module_precompile(state.native, mod.bytes) do
-          {:ok, precompiled} ->
-            {:ok, precompiled,
-             %{state | precompiled: Map.put(state.precompiled, key, precompiled)}}
-
-          {:error, reason} ->
-            {:error, reason}
-        end
+        {:noreply, state}
     end
   end
 
-  defp encode_input(input, opts) do
-    case Keyword.get(opts, :encoding, :json) do
-      :json -> Jason.encode(input)
-      :raw when is_binary(input) -> {:ok, input}
-      :raw -> {:error, :raw_input_must_be_binary}
+  def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+    case Enum.find(state.jobs, fn {_pid, job} ->
+           job.monitor == ref || job.caller_monitor == ref
+         end) do
+      nil ->
+        {:noreply, state}
+
+      {pid, %{monitor: ^ref} = job} ->
+        cleanup(job)
+        if job.from, do: GenServer.reply(job.from, error(:trap, "execution worker stopped"))
+        {:noreply, %{state | jobs: Map.delete(state.jobs, pid)}}
+
+      {pid, job} ->
+        cancel(pid, job)
+        {:noreply, put_in(state.jobs[pid].from, nil)}
     end
   end
 
-  defp decode_output(<<>>, _opts), do: {:ok, nil}
+  @impl true
+  def terminate(_reason, state) do
+    Enum.each(state.jobs, fn {pid, job} -> cancel(pid, job) end)
+  end
 
-  defp decode_output(bytes, opts) do
-    case Keyword.get(opts, :encoding, :json) do
-      :json -> Jason.decode(bytes)
-      :raw -> {:ok, bytes}
+  defp new_native(:isolated, _plugin, _opts), do: Isolated.available()
+
+  defp new_native(:in_process, plugin, opts) do
+    Native.runtime_new(plugin, %{
+      max_cache_bytes: Keyword.get(opts, :max_cache_bytes, 64 * 1024 * 1024),
+      max_cached_modules: Keyword.get(opts, :max_cached_modules, 64)
+    })
+  end
+
+  defp start_job(from, started, timeout, state, work) do
+    with :ok <- capacity(state),
+         remaining = timeout - (now() - started),
+         :ok <- remaining_time(remaining) do
+      control = if state.backend == :in_process, do: Native.control_new(remaining)
+      server = self()
+
+      {pid, monitor} =
+        spawn_monitor(fn ->
+          result = work.(control, server, remaining)
+          send(server, {:result, self(), result})
+        end)
+
+      job = %{
+        from: from,
+        monitor: monitor,
+        caller_monitor: Process.monitor(elem(from, 0)),
+        timer: Process.send_after(self(), {:timeout, pid}, remaining),
+        control: control,
+        deadline: started + timeout
+      }
+
+      {:noreply, put_in(state.jobs[pid], job)}
+    else
+      {:error, _} = error -> {:reply, error, state}
     end
   end
 
-  defp build_opts(opts, state) do
-    %{
-      timeout_ms: Keyword.get(opts, :timeout, state.default_timeout),
-      fuel: Keyword.get(opts, :fuel, state.default_fuel),
-      max_memory: Keyword.get(opts, :max_memory, state.default_max_memory),
-      env: Keyword.get(opts, :env, [])
-    }
+  defp cancel(pid, job) do
+    if job.control, do: Native.cancel(job.control)
+    send(pid, :cancel)
   end
 
-  defp translate(:timeout), do: %RuntimeError{kind: :timeout, message: "execution timed out"}
+  defp execute(state, mod, input, limits, control, server) do
+    with {:ok, input} <- encode(input, limits),
+         {:ok, bytes} <- run_native(state, mod, input, limits, control, server) do
+      decode(bytes, limits.encoding)
+    else
+      {:error, {kind, message}} -> error(kind, message)
+      {:error, _} = error -> error
+    end
+  rescue
+    exception -> error(:trap, Exception.message(exception))
+  end
 
-  defp translate(:fuel_exhausted),
-    do: %RuntimeError{kind: :fuel_exhausted, message: "fuel exhausted"}
+  defp run_native(%{backend: :isolated} = state, mod, input, limits, _control, server) do
+    Isolated.run(state.plugin, mod, input, limits, state.max_process_memory, server)
+  end
 
-  defp translate(:oom), do: %RuntimeError{kind: :oom, message: "memory limit exceeded"}
-  defp translate({:js_error, message}), do: %RuntimeError{kind: :js_error, message: message}
-  defp translate({:trap, message}), do: %RuntimeError{kind: :trap, message: message}
-  defp translate(other), do: %RuntimeError{kind: :unknown, message: inspect(other)}
+  defp run_native(state, mod, input, limits, control, _server) do
+    Native.run(state.native, mod.bytes, input, Options.native(limits, mod.mode), control)
+  end
+
+  defp encode(input, %{encoding: :raw, max_input: max}) when is_binary(input) do
+    if byte_size(input) <= max,
+      do: {:ok, input},
+      else: error(:input_limit, "input limit exceeded")
+  end
+
+  defp encode(_input, %{encoding: :raw}), do: error(:invalid_options, "raw input must be binary")
+
+  defp encode(input, %{max_input: max}) do
+    with {:ok, iodata} <- Jason.encode_to_iodata(input) do
+      if IO.iodata_length(iodata) <= max,
+        do: {:ok, IO.iodata_to_binary(iodata)},
+        else: error(:input_limit, "input limit exceeded")
+    end
+  end
+
+  defp decode(bytes, :raw), do: {:ok, bytes}
+  defp decode(<<>>, :json), do: {:ok, nil}
+  defp decode(bytes, :json), do: Jason.decode(bytes)
+
+  defp check_module(%Module{bytes: bytes, mode: mode} = mod, state, limits)
+       when is_binary(bytes) and mode in [:static, :dynamic] do
+    cond do
+      byte_size(bytes) > limits.max_module ->
+        error(:module_limit, "Wasm module limit exceeded")
+
+      mode == :static || mod.provider_hash == state.plugin_hash ->
+        :ok
+
+      true ->
+        {:error, %IncompatibleProviderError{expected: state.plugin_hash, got: mod.provider_hash}}
+    end
+  end
+
+  defp check_module(_mod, _state, _limits), do: error(:invalid_options, "invalid compiled module")
+
+  defp capacity(state) do
+    if map_size(state.jobs) < state.max_concurrency,
+      do: :ok,
+      else: error(:busy, "runtime is at capacity")
+  end
+
+  defp remaining_time(remaining) do
+    if remaining > 0, do: :ok, else: error(:timeout, "execution timed out before admission")
+  end
+
+  defp cleanup(job) do
+    Process.cancel_timer(job.timer)
+    Process.demonitor(job.monitor, [:flush])
+    Process.demonitor(job.caller_monitor, [:flush])
+  end
+
+  defp error(kind, message), do: {:error, %RuntimeError{kind: kind, message: message}}
+  defp now, do: System.monotonic_time(:millisecond)
 end
