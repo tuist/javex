@@ -1,0 +1,18 @@
+[package]
+name = "javex_plugin"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow = "1"
+javy = "=7.0.0"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true

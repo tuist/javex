@@ -20,7 +20,7 @@ mod process {
     use std::time::{Duration, Instant};
 
     use crate::{compiler, isolation, sandbox};
-    use sandbox::{Budgets, CacheOptions, Control};
+    use sandbox::{Budgets, CacheOptions, Control, Execution, Progress};
 
     const MAX_REQUEST: usize = 64 * 1024 * 1024;
     const MAX_HEADER: usize = 1024 * 1024;
@@ -60,6 +60,14 @@ mod process {
         ])
     }
 
+    fn event(kind: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        let mut output = io::stdout().lock();
+        write_frame(&mut output, &serde_json::to_vec(kind)?)?;
+        write_frame(&mut output, bytes)?;
+        output.flush()?;
+        Ok(())
+    }
+
     fn response(result: Result<Vec<u8>, (&str, String)>, maximum: usize) -> anyhow::Result<()> {
         let (kind, bytes) = match result {
             Ok(bytes) => ("ok", bytes),
@@ -70,12 +78,7 @@ mod process {
         } else {
             (kind, bytes)
         };
-        let header = serde_json::to_vec(kind)?;
-        let mut output = io::stdout().lock();
-        write_frame(&mut output, &header)?;
-        write_frame(&mut output, &bytes)?;
-        output.flush()?;
-        Ok(())
+        event(kind, &bytes)
     }
 
     fn child(parent: u32, memory: u64, timeout: u64, maximum: usize) -> anyhow::Result<()> {
@@ -116,7 +119,23 @@ mod process {
                 },
             )
             .map_err(|error| ("trap", format!("{error:#}")))
-            .and_then(|runtime| sandbox::run(&runtime, &module, &input, &request.limits, control)),
+            .and_then(|runtime| {
+                let mut execution =
+                    Execution::start(&runtime, &module, &input, &request.limits, control)?;
+                let mut completion = b"[]".to_vec();
+                loop {
+                    match execution.advance(&completion)? {
+                        Progress::Done(bytes) => break Ok(bytes),
+                        Progress::Pending(bytes) => {
+                            event("callbacks", &bytes)
+                                .map_err(|e| ("worker_error", e.to_string()))?;
+                            let mut remaining = MAX_REQUEST;
+                            completion = read_frame(&mut io::stdin(), &mut remaining)
+                                .map_err(|e| ("worker_error", e.to_string()))?;
+                        }
+                    }
+                }
+            }),
             _ => Err(("worker_error", "unknown worker operation".into())),
         };
         response(result, maximum)
@@ -126,6 +145,17 @@ mod process {
         let deadline = Instant::now() + Duration::from_millis(timeout);
         let mut input = io::stdin();
         let request = request(&mut input)?;
+        let budgets: Request = serde_json::from_slice(&request[0])?;
+        let max_callbacks = budgets.limits.max_callback_calls as usize;
+        let callback_maximum = budgets.limits.callback_request_limit();
+        let completion_maximum = budgets.limits.callback_completion_limit();
+        let result_maximum = if budgets.operation == "compile" {
+            budgets.limits.max_module
+        } else {
+            budgets.limits.max_output
+        }
+        .min(MAX_REQUEST);
+        let diagnostic_maximum = budgets.limits.max_stderr.clamp(4096, MAX_REQUEST);
         let mut child = Command::new(std::env::current_exe()?)
             .args([
                 "--child".to_owned(),
@@ -142,29 +172,82 @@ mod process {
         let cancelled = Arc::new(AtomicBool::new(false));
         let signal = cancelled.clone();
         let mut child_input = child.stdin.take().unwrap();
+        // Read cancellation independently of writes to the child: a child stuck
+        // in JS must not hide port EOF/cancel behind a full reply pipe.
+        let (sender, replies) = std::sync::mpsc::sync_channel::<Vec<u8>>(
+            budgets.limits.max_callback_concurrency as usize,
+        );
         std::thread::spawn(move || {
-            let result = request
+            if request
                 .iter()
-                .try_for_each(|bytes| write_frame(&mut child_input, bytes));
-            drop(child_input);
-            if result.is_ok() {
-                // Any further byte, EOF, or transport error cancels the child.
-                let _ = input.read(&mut [0]);
+                .try_for_each(|bytes| write_frame(&mut child_input, bytes))
+                .is_err()
+            {
+                signal.store(true, Ordering::Release);
+                return;
+            }
+            while let Ok(bytes) = replies.recv() {
+                if write_frame(&mut child_input, &bytes).is_err() {
+                    break;
+                }
+            }
+            signal.store(true, Ordering::Release);
+        });
+        let signal = cancelled.clone();
+        std::thread::spawn(move || {
+            let mut remaining = MAX_REQUEST;
+            for _ in 0..=max_callbacks {
+                let mut frame_budget = remaining.min(completion_maximum);
+                match read_frame(&mut input, &mut frame_budget) {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        remaining -= bytes.len();
+                        if sender.try_send(bytes).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
             }
             signal.store(true, Ordering::Release);
         });
         let overflow = Arc::new(AtomicBool::new(false));
         let signal = overflow.clone();
-        let output = child.stdout.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
         let reader = std::thread::spawn(move || {
-            // Never forward the child's stdout directly to BEAM. This bound still
-            // holds if a native-code escape writes outside the WASI output buffers.
-            let mut bytes = Vec::new();
-            let result = output
-                .take((maximum + 4096 + 1) as u64)
-                .read_to_end(&mut bytes);
-            signal.store(bytes.len() > maximum + 4096, Ordering::Release);
-            (result, bytes)
+            // Validate lengths and cumulative traffic before allocating/forwarding,
+            // even if a native-code escape forges child protocol frames.
+            let result = (|| -> anyhow::Result<()> {
+                let mut remaining = MAX_REQUEST;
+                // Initial state, at most one state per completion, and final
+                // output. A pending root with no requests waits for its deadline.
+                for _ in 0..=max_callbacks + 1 {
+                    let mut header_budget = 4096.min(remaining);
+                    let header = read_frame(&mut output, &mut header_budget)?;
+                    remaining -= header.len();
+                    let kind: String = serde_json::from_slice(&header)?;
+                    let maximum = match kind.as_str() {
+                        "callbacks" => callback_maximum,
+                        "ok" => result_maximum,
+                        "timeout" | "cancelled" | "fuel_exhausted" | "oom" | "js_error"
+                        | "trap" | "output_limit" | "diagnostic_limit" | "input_limit"
+                        | "module_limit" | "compile_error" | "worker_error" | "callback_limit"
+                        | "callback_timeout" => diagnostic_maximum,
+                        _ => anyhow::bail!("unknown worker event"),
+                    };
+                    let mut payload_budget = maximum.min(remaining);
+                    let bytes = read_frame(&mut output, &mut payload_budget)?;
+                    remaining -= bytes.len();
+                    event(&kind, &bytes)?;
+                    if kind != "callbacks" {
+                        let mut extra = [0];
+                        anyhow::ensure!(output.read(&mut extra)? == 0, "extra worker output");
+                        return Ok(());
+                    }
+                }
+                anyhow::bail!("too many worker protocol frames")
+            })();
+            signal.store(result.is_err(), Ordering::Release);
+            result
         });
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -186,15 +269,13 @@ mod process {
             }
             std::thread::sleep(Duration::from_millis(2));
         };
-        if status == 0 {
-            let (result, bytes) = reader
+        if status == 0
+            && reader
                 .join()
-                .map_err(|_| anyhow::anyhow!("IPC reader failed"))?;
-            result?;
-            if bytes.len() > maximum + 4096 {
-                return Ok(126);
-            }
-            io::stdout().write_all(&bytes)?;
+                .map_err(|_| anyhow::anyhow!("IPC reader failed"))?
+                .is_err()
+        {
+            return Ok(126);
         }
         Ok(status)
     }

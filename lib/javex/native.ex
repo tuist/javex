@@ -30,7 +30,8 @@ defmodule Javex.Native do
   def runtime_stats(_runtime), do: err()
   def control_new(_timeout_ms), do: err()
   def cancel(_control), do: err()
-  def run(_runtime, _wasm, _input, _opts, _control), do: err()
+  def run_start(_runtime, _wasm, _input, _opts, _control), do: err()
+  def run_step(_execution, _completion), do: err()
 
   defp err, do: :erlang.nif_error(:nif_not_loaded)
 end

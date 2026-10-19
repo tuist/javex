@@ -5,22 +5,26 @@ mod output;
 mod sandbox;
 
 use rustler::{Atom, Binary, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
-use sandbox::{Budgets, CacheOptions, CacheStats, Control, Runtime};
+use sandbox::{Budgets, CacheOptions, CacheStats, Control, Execution, Progress, Runtime};
 use sha2::{Digest, Sha256};
+use std::sync::Mutex;
 
 mod atoms {
-    rustler::atoms! { ok, error, dynamic, static_ = "static" }
+    rustler::atoms! { ok, error, dynamic, continue_, static_ = "static" }
 }
 
 rustler::init!("Elixir.Javex.Native");
 
 pub struct RuntimeResource(Runtime);
 pub struct ControlResource(Control);
+pub struct ExecutionResource(Mutex<Option<Execution>>);
 
 #[rustler::resource_impl]
 impl rustler::Resource for RuntimeResource {}
 #[rustler::resource_impl]
 impl rustler::Resource for ControlResource {}
+#[rustler::resource_impl]
+impl rustler::Resource for ExecutionResource {}
 
 #[rustler::nif]
 fn control_new(timeout_ms: u64) -> NifResult<ResourceArc<ControlResource>> {
@@ -79,7 +83,7 @@ fn compile<'a>(
 }
 
 #[rustler::nif(schedule = "DirtyCpu")]
-fn run<'a>(
+fn run_start<'a>(
     env: Env<'a>,
     runtime: ResourceArc<RuntimeResource>,
     wasm: Binary<'a>,
@@ -87,16 +91,54 @@ fn run<'a>(
     opts: Budgets,
     control: ResourceArc<ControlResource>,
 ) -> NifResult<Term<'a>> {
-    match sandbox::run(
+    match Execution::start(
         &runtime.0,
         wasm.as_slice(),
         input.as_slice(),
         &opts,
         control.0.clone(),
     ) {
-        Ok(bytes) => Ok((atoms::ok(), binary(env, &bytes)?).encode(env)),
-        // Kinds are constants in the execution core, never guest-controlled strings.
+        Ok(execution) => advance(
+            env,
+            ResourceArc::new(ExecutionResource(Mutex::new(Some(execution)))),
+            b"[]",
+        ),
         Err((kind, message)) => {
+            Ok((atoms::error(), (Atom::from_str(env, kind)?, message)).encode(env))
+        }
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn run_step<'a>(
+    env: Env<'a>,
+    execution: ResourceArc<ExecutionResource>,
+    completion: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    advance(env, execution, completion.as_slice())
+}
+
+fn advance<'a>(
+    env: Env<'a>,
+    execution: ResourceArc<ExecutionResource>,
+    completion: &[u8],
+) -> NifResult<Term<'a>> {
+    let mut slot = execution.0.try_lock().map_err(|_| rustler::Error::BadArg)?;
+    let result = slot
+        .as_mut()
+        .ok_or(rustler::Error::BadArg)?
+        .advance(completion);
+    match result {
+        Ok(Progress::Done(bytes)) => {
+            *slot = None;
+            Ok((atoms::ok(), binary(env, &bytes)?).encode(env))
+        }
+        Ok(Progress::Pending(bytes)) => {
+            drop(slot);
+            Ok((atoms::continue_(), execution, binary(env, &bytes)?).encode(env))
+        }
+        Err((kind, message)) => {
+            *slot = None;
             Ok((atoms::error(), (Atom::from_str(env, kind)?, message)).encode(env))
         }
     }

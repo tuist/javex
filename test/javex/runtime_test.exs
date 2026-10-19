@@ -271,6 +271,16 @@ defmodule Javex.RuntimeTest do
             [timeout: 0],
             [timeout: 2_147_483_648],
             [encoding: :invalid],
+            [callbacks: []],
+            [callbacks: %{lookup: fn _, _ -> {:ok, nil} end}],
+            [callbacks: %{"lookup" => fn _ -> {:ok, nil} end}],
+            [callbacks: %{"" => fn _, _ -> {:ok, nil} end}],
+            [callbacks: %{<<255>> => fn _, _ -> {:ok, nil} end}],
+            [max_callback_calls: 1025],
+            [max_callback_concurrency: 0],
+            [max_callback_input: 0],
+            [max_callback_output: 8 * 1024 * 1024 + 1],
+            [callback_timeout: nil],
             [unknown: true],
             [fuel: 1, fuel: 2],
             [env: [{"A=B", "bad"}]],
@@ -327,10 +337,14 @@ defmodule Javex.RuntimeTest do
       assert {:ok, [8, 8, 0]} = Javex.run(dynamic, nil, max_memory: 3 * 1024 * 1024)
     end
 
-    test "pending Promise jobs fail instead of silently dropping workflow work" do
-      {:ok, mod} = Javex.compile("Promise.resolve().then(() => {});")
-      assert {:error, %RuntimeError{kind: :js_error, message: message}} = Javex.run(mod, nil)
-      assert message =~ "Pending jobs"
+    test "awaited Promise jobs finish before collecting stdout" do
+      {:ok, mod} =
+        Javex.compile(~S"""
+        const value = await Promise.resolve(17).then(n => n + 6);
+        Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(value)));
+        """)
+
+      assert {:ok, 23} = Javex.run(mod, nil)
     end
 
     test "an early failure cannot shorten the deadline of a later call" do
@@ -418,6 +432,435 @@ defmodule Javex.RuntimeTest do
       {:ok, mod} = Javex.compile("// too big to cache")
       assert {:ok, nil} = Javex.run(mod, nil, runtime: name)
       assert %{cached_modules: 0, cache_bytes: 0} = Runtime.stats(name)
+    end
+  end
+
+  for backend <- [:in_process] ++ if(:os.type() == {:unix, :linux}, do: [:isolated], else: []) do
+    describe "#{backend} Promise callbacks" do
+      @describetag timeout: 120_000
+
+      setup do
+        %{runtime: start_runtime("callbacks", backend: unquote(backend), max_concurrency: 1)}
+      end
+
+      test "Promise.all starts both callbacks before either finishes and correlates out-of-order replies",
+           %{runtime: runtime} do
+        parent = self()
+
+        callback = fn value, %{deadline: deadline} ->
+          send(parent, {:started, value, self(), deadline})
+
+          receive do
+            :finish -> {:ok, %{"value" => value}}
+          end
+        end
+
+        for mode <- [:dynamic, :static] do
+          {:ok, mod} =
+            Javex.compile(
+              ~S"""
+              const values = await Promise.all([
+                Javex.Host.call("lookup", "first"),
+                Javex.Host.call("lookup", "second")
+              ]);
+              const again = await Javex.Host.call("lookup", "third");
+              Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify([values, again])));
+              """,
+              mode: mode
+            )
+
+          task =
+            Task.async(fn ->
+              Javex.run(mod, nil,
+                runtime: runtime,
+                callbacks: %{"lookup" => callback},
+                timeout: 30_000,
+                callback_timeout: 10_000
+              )
+            end)
+
+          assert_receive {:started, "first", first, deadline}, 10_000
+          assert_receive {:started, "second", second, _}, 10_000
+          assert deadline > System.monotonic_time(:millisecond)
+          assert Runtime.stats(runtime).running == 1
+          assert {:error, %RuntimeError{kind: :busy}} = Javex.run(mod, nil, runtime: runtime)
+          ref = Process.monitor(second)
+          send(second, :finish)
+          assert_receive {:DOWN, ^ref, :process, ^second, :normal}
+          send(first, :finish)
+          assert_receive {:started, "third", third, _}, 10_000
+          send(third, :finish)
+
+          assert {:ok, [[%{"value" => "first"}, %{"value" => "second"}], %{"value" => "third"}]} =
+                   Task.await(task, 30_000)
+        end
+      end
+
+      test "grants are per-run and declared errors and crashes become safe JS rejections", %{
+        runtime: runtime
+      } do
+        {:ok, mod} =
+          Javex.compile(~S"""
+          let result;
+          try { result = await Javex.Host.call("lookup", {n: 7}); }
+          catch (error) { result = {code: error.code, message: error.message, name: error.name}; }
+          Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(result)));
+          """)
+
+        opts = [runtime: runtime, timeout: 30_000]
+
+        assert {:ok, %{"n" => 7}} =
+                 Javex.run(
+                   mod,
+                   nil,
+                   opts ++ [callbacks: %{"lookup" => fn arg, _ -> {:ok, arg} end}]
+                 )
+
+        assert {:ok, %{"code" => "capability_denied", "name" => "HostError"}} =
+                 Javex.run(mod, nil, opts)
+
+        assert {:ok, %{"code" => "unavailable", "message" => "Try later"}} =
+                 Javex.run(
+                   mod,
+                   nil,
+                   opts ++
+                     [
+                       callbacks: %{
+                         "lookup" => fn _, _ ->
+                           {:error, %{"code" => "unavailable", "message" => "Try later"}}
+                         end
+                       }
+                     ]
+                 )
+
+        assert {:ok, %{"code" => "callback_failed", "message" => "Host callback failed"}} =
+                 Javex.run(
+                   mod,
+                   nil,
+                   opts ++ [callbacks: %{"lookup" => fn _, _ -> raise "secret credential" end}]
+                 )
+
+        assert {:ok, %{"code" => "callback_failed"}} =
+                 Javex.run(
+                   mod,
+                   nil,
+                   opts ++ [callbacks: %{"lookup" => fn _, _ -> {:ok, %{not_json: self()}} end}]
+                 )
+
+        for callback <- [
+              fn _, _ -> :invalid end,
+              fn _, _ -> throw("secret credential") end,
+              fn _, _ -> Process.exit(self(), :kill) end
+            ] do
+          assert {:ok, %{"code" => "callback_failed", "name" => "HostError"}} =
+                   Javex.run(mod, nil, opts ++ [callbacks: %{"lookup" => callback}])
+        end
+
+        value = [nil, true, 1.25, %{"nested" => [false, 42]}]
+
+        assert {:ok, ^value} =
+                 Javex.run(
+                   mod,
+                   nil,
+                   opts ++ [callbacks: %{"lookup" => fn _, _ -> {:ok, value} end}]
+                 )
+
+        assert {:error, %RuntimeError{kind: :callback_limit}} =
+                 Javex.run(mod, nil, opts ++ [max_callback_output: 8])
+
+        {:ok, uncaught} = Javex.compile(~S|await Javex.Host.call("missing", null);|)
+
+        assert {:error, %RuntimeError{kind: :js_error, message: message}} =
+                 Javex.run(uncaught, nil, opts)
+
+        assert message =~ "Callback is not granted"
+      end
+
+      test "callback byte budgets include UTF-8 and exact boundaries and cannot be caught away",
+           %{runtime: runtime} do
+        {:ok, mod} =
+          Javex.compile(~S"""
+          try {
+            const result = await Javex.Host.call("echo", "é");
+            Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(result)));
+          } catch (_) { Javy.IO.writeSync(1, new TextEncoder().encode('"caught"')); }
+          """)
+
+        opts = [
+          runtime: runtime,
+          timeout: 30_000,
+          callbacks: %{"echo" => fn arg, _ -> {:ok, arg} end}
+        ]
+
+        assert {:ok, "é"} =
+                 Javex.run(mod, nil, opts ++ [max_callback_input: 4, max_callback_output: 4])
+
+        assert {:ok, ~s("é")} = Javex.run(mod, <<>>, opts ++ [encoding: :raw])
+
+        for budget <- [[max_callback_input: 3], [max_callback_output: 3], [max_callback_calls: 0]] do
+          assert {:error, %RuntimeError{kind: :callback_limit}} =
+                   Javex.run(mod, nil, opts ++ budget)
+        end
+
+        {:ok, concurrent} =
+          Javex.compile(~S"""
+          try { await Promise.all([Javex.Host.call("echo", 1), Javex.Host.call("echo", 2)]); }
+          catch (_) {}
+          """)
+
+        assert {:error, %RuntimeError{kind: :callback_limit}} =
+                 Javex.run(concurrent, nil, opts ++ [max_callback_concurrency: 1])
+
+        {:ok, sequential} =
+          Javex.compile(~S"""
+          try { await Javex.Host.call("echo", 1); await Javex.Host.call("echo", 2); }
+          catch (_) {}
+          """)
+
+        assert {:error, %RuntimeError{kind: :callback_limit}} =
+                 Javex.run(sequential, nil, opts ++ [max_callback_calls: 1])
+
+        {:ok, reentrant} =
+          Javex.compile(~S"""
+          let nested;
+          const first = Javex.Host.call("echo", {toJSON() {
+            nested = Javex.Host.call("echo", 9);
+            return 23;
+          }});
+          const result = await Promise.all([first, nested]);
+          Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(result)));
+          """)
+
+        assert {:ok, [23, 9]} = Javex.run(reentrant, nil, opts)
+      end
+
+      test "caller death and callback timeout stop host work before releasing admission", %{
+        runtime: runtime
+      } do
+        parent = self()
+
+        callback = fn _, _ ->
+          send(parent, {:waiting, self()})
+
+          receive do
+            :never -> {:ok, nil}
+          end
+        end
+
+        {:ok, mod} = Javex.compile(~S|await Javex.Host.call("wait", null);|)
+
+        caller =
+          spawn(fn ->
+            Javex.run(mod, nil,
+              runtime: runtime,
+              callbacks: %{"wait" => callback},
+              callback_timeout: 30_000,
+              timeout: 30_000
+            )
+          end)
+
+        on_exit(fn -> Process.exit(caller, :kill) end)
+        assert_receive {:waiting, worker}, 10_000
+        ref = Process.monitor(worker)
+        Process.exit(caller, :kill)
+        assert_receive {:DOWN, ^ref, :process, ^worker, :killed}, 10_000
+        eventually(fn -> Runtime.stats(runtime).running == 0 end)
+
+        assert {:error, %RuntimeError{kind: :callback_timeout}} =
+                 Javex.run(mod, nil,
+                   runtime: runtime,
+                   callbacks: %{"wait" => callback},
+                   callback_timeout: 50,
+                   timeout: 30_000
+                 )
+
+        assert_receive {:waiting, timed_out}, 10_000
+        ref = Process.monitor(timed_out)
+        assert_receive {:DOWN, ^ref, :process, ^timed_out, _}, 10_000
+        assert Runtime.stats(runtime).running == 0
+      end
+
+      test "settling the root cancels detached callbacks before returning", %{runtime: runtime} do
+        parent = self()
+
+        callback = fn value, _ ->
+          send(parent, {:race, value, self()})
+
+          receive do
+            :finish -> {:ok, value}
+          end
+        end
+
+        {:ok, mod} =
+          Javex.compile(~S"""
+          const result = await Promise.race([Javex.Host.call("race", "winner"), Javex.Host.call("race", "detached")]);
+          Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(result)));
+          """)
+
+        task =
+          Task.async(fn ->
+            Javex.run(mod, nil,
+              runtime: runtime,
+              callbacks: %{"race" => callback},
+              timeout: 30_000,
+              callback_timeout: 10_000
+            )
+          end)
+
+        assert_receive {:race, "winner", winner}, 10_000
+        assert_receive {:race, "detached", detached}, 10_000
+        ref = Process.monitor(detached)
+        send(winner, :finish)
+        assert {:ok, "winner"} = Task.await(task, 30_000)
+        assert_receive {:DOWN, ^ref, :process, ^detached, :killed}
+        assert Runtime.stats(runtime).running == 0
+      end
+
+      test "overall deadlines and runtime shutdown also cancel pending callbacks", %{
+        runtime: runtime
+      } do
+        parent = self()
+
+        callback = fn _, _ ->
+          send(parent, {:pending, self()})
+
+          receive do
+            :never -> {:ok, nil}
+          end
+        end
+
+        {:ok, mod} = Javex.compile(~S|await Javex.Host.call("wait", null);|)
+        opts = [runtime: runtime, callbacks: %{"wait" => callback}, callback_timeout: 30_000]
+        task = Task.async(fn -> Javex.run(mod, nil, opts ++ [timeout: 15_000]) end)
+        assert_receive {:pending, callback_pid}, 10_000
+        ref = Process.monitor(callback_pid)
+        assert {:error, %RuntimeError{kind: :timeout}} = Task.await(task, 20_000)
+        assert_receive {:DOWN, ^ref, :process, ^callback_pid, :killed}, 10_000
+        eventually(fn -> Runtime.stats(runtime).running == 0 end)
+
+        task = Task.async(fn -> Javex.run(mod, nil, opts ++ [timeout: 30_000]) end)
+        assert_receive {:pending, callback_pid}, 10_000
+        ref = Process.monitor(callback_pid)
+        GenServer.stop(runtime)
+        assert {:error, %RuntimeError{kind: :runtime_down}} = Task.await(task, 10_000)
+        assert_receive {:DOWN, ^ref, :process, ^callback_pid, :killed}, 10_000
+      end
+
+      test "an unresolved root waits for its deadline, even with no callback budget", %{
+        runtime: runtime
+      } do
+        {:ok, mod} = Javex.compile("await new Promise(() => {});")
+
+        assert {:error, %RuntimeError{kind: :timeout}} =
+                 Javex.run(mod, nil, runtime: runtime, timeout: 1500, max_callback_calls: 0)
+      end
+
+      test "JS diagnostics respect their separate byte limit", %{runtime: runtime} do
+        {:ok, mod} = Javex.compile(~S|throw new Error("secret".repeat(100));|)
+
+        assert {:error, %RuntimeError{kind: :diagnostic_limit}} =
+                 Javex.run(mod, nil, runtime: runtime, timeout: 30_000, max_stderr: 64)
+
+        {:ok, mod} = Javex.compile(~S|throw new Error("x".repeat(9000));|)
+
+        assert {:error, %RuntimeError{kind: :js_error, message: message}} =
+                 Javex.run(mod, nil,
+                   runtime: runtime,
+                   timeout: 30_000,
+                   max_callback_input: 1,
+                   max_callback_concurrency: 1,
+                   max_stderr: 16_384
+                 )
+
+        assert message =~ String.duplicate("x", 9000)
+      end
+
+      test "prototype mutation cannot corrupt the host bridge or suppress terminal limits", %{
+        runtime: runtime
+      } do
+        {:ok, mod} =
+          Javex.compile(~S"""
+          Object.prototype.toJSON = function () {
+            if ("fatal" in this) return {done: true, fatal: false, requests: []};
+            return this;
+          };
+          Map.prototype.get = Map.prototype.set = Map.prototype.delete = () => { throw new Error("mutated Map"); };
+          Object.defineProperty(Map.prototype, "size", {get() { throw new Error("mutated size"); }});
+          Array.prototype.push = Array.prototype.join = () => { throw new Error("mutated Array"); };
+          Array.prototype[Symbol.iterator] = () => { throw new Error("mutated iterator"); };
+          const result = await Javex.Host.call('echo"🌶', {value: 'line\n"quoted"\\tail'});
+          if (result.value !== 'line\n"quoted"\\tail') throw new Error("wrong callback result");
+          Javy.IO.writeSync(1, new TextEncoder().encode("7"));
+          """)
+
+        assert {:ok, 7} =
+                 Javex.run(mod, nil,
+                   runtime: runtime,
+                   timeout: 30_000,
+                   callbacks: %{"echo\"🌶" => fn arg, _ -> {:ok, arg} end}
+                 )
+
+        {:ok, mod} =
+          Javex.compile(~S"""
+          Object.prototype.toJSON = function () {
+            if ("fatal" in this) return {done: true, fatal: false, requests: []};
+            return this;
+          };
+          try { await Javex.Host.call("echo", null); } catch (_) {}
+          """)
+
+        assert {:error, %RuntimeError{kind: :callback_limit}} =
+                 Javex.run(mod, nil, runtime: runtime, timeout: 30_000, max_callback_calls: 0)
+      end
+
+      test "forged guest states cannot bypass host quotas or leave partial batches alive", %{
+        runtime: runtime
+      } do
+        parent = self()
+        bytes = File.read!(Path.expand("../fixtures/callback_probe.wasm", __DIR__))
+        mod = %Javex.Module{bytes: bytes, mode: :static}
+
+        callback = fn _, _ ->
+          send(parent, {:forged, self()})
+
+          receive do
+            :never -> {:ok, nil}
+          end
+        end
+
+        request = %{"id" => 1, "name" => "wait", "argument" => "null"}
+
+        opts = [
+          runtime: runtime,
+          encoding: :raw,
+          callbacks: %{"wait" => callback},
+          timeout: 30_000
+        ]
+
+        state = Jason.encode!(%{done: false, requests: [request, request]})
+        assert {:error, %RuntimeError{kind: :callback_limit}} = Javex.run(mod, state, opts)
+        # The first callback may or may not have been scheduled before cleanup.
+        receive do
+          {:forged, pid} -> refute Process.alive?(pid)
+        after
+          0 -> :ok
+        end
+
+        for {requests, limits} <- [
+              {[request], [max_callback_calls: 0]},
+              {[request, %{request | "id" => 2}], [max_callback_concurrency: 1]},
+              {[request], [max_callback_input: 3]}
+            ] do
+          state = Jason.encode!(%{done: false, requests: requests})
+
+          assert {:error, %RuntimeError{kind: :callback_limit}} =
+                   Javex.run(mod, state, opts ++ limits)
+
+          refute_receive {:forged, _}, 10
+        end
+
+        assert Runtime.stats(runtime).running == 0
+      end
     end
   end
 

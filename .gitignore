@@ -13,6 +13,7 @@ erl_crash.dump
 
 # Rust / NIF
 /native/javex_nif/target/
+/native/javex_plugin/target/
 /priv/native/
 
 # macOS

@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+packages=(build-essential autoconf libncurses-dev libssl-dev pkg-config clang libclang-dev lld wasi-libc)
+missing=()
+for package in "${packages[@]}"; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
+    missing+=("$package")
+  fi
+done
+if ((${#missing[@]})); then
+  sudo apt-get update -qq
+  sudo apt-get install -y "${missing[@]}"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+if ! command -v mise >/dev/null; then
+  curl -fsSL https://mise.run | sh
+fi
+if ! grep -Fq '# Javex orb toolchains' "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'PROFILE'
+
+# Javex orb toolchains
+export PATH="$HOME/.local/share/mise/shims:$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+PROFILE
+fi
+mise trust
+mise install
+mise exec -- rustup target add wasm32-wasip1
+mise exec -- mix local.hex --force
+mise exec -- mix local.rebar --force
+mise exec -- mix deps.get
+
+# Only needed to rebuild the bundled custom provider. Verify the pinned CLI.
+if [[ ! -x "$HOME/.local/bin/javy" ]] || [[ "$("$HOME/.local/bin/javy" --version)" != 'javy 8.1.1' ]]; then
+  download="$(mktemp)"
+  trap 'rm -f "$download"' EXIT
+  curl -fsSL https://github.com/bytecodealliance/javy/releases/download/v8.1.1/javy-x86_64-linux-v8.1.1.gz -o "$download"
+  echo "4bec224e1d51827808fd063541a2b4d94cf474744636b692be63e7a29bec83a6  $download" | sha256sum -c -
+  gzip -dc "$download" > "$HOME/.local/bin/javy"
+  chmod +x "$HOME/.local/bin/javy"
+fi
