@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(realpath "$(dirname "$0")/../..")"
+javy="${JAVY:-javy}"
+if [[ "$("$javy" --version)" != "javy 8.1.1" ]]; then
+  echo "Javy 8.1.1 is required to initialize the bundled provider" >&2
+  exit 1
+fi
+
+rustup target add wasm32-wasip1
+cargo --config "$root/native/javex_plugin/.cargo/config.toml" build \
+  --manifest-path "$root/native/javex_plugin/Cargo.toml" \
+  --locked --release --target wasm32-wasip1
+"$javy" init-plugin \
+  "$root/native/javex_plugin/target/wasm32-wasip1/release/javex_plugin.wasm" \
+  --deterministic -o "${1:-$root/priv/javy_plugin.wasm}"

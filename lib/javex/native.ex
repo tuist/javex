@@ -31,6 +31,8 @@ defmodule Javex.Native do
   def control_new(_timeout_ms), do: err()
   def cancel(_control), do: err()
   def run(_runtime, _wasm, _input, _opts, _control), do: err()
+  def run_start(_runtime, _wasm, _input, _opts, _control), do: err()
+  def callback_reply(_reply, _bytes), do: err()
 
   defp err, do: :erlang.nif_error(:nif_not_loaded)
 end

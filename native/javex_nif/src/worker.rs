@@ -2,6 +2,8 @@
 //! No untrusted Wasm or JavaScript is parsed in the supervisor or the BEAM.
 
 #[cfg(target_os = "linux")]
+mod callbacks;
+#[cfg(target_os = "linux")]
 pub mod compiler;
 #[cfg(target_os = "linux")]
 mod isolation;
@@ -19,7 +21,7 @@ mod process {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};
 
-    use crate::{compiler, isolation, sandbox};
+    use crate::{callbacks, compiler, isolation, sandbox};
     use sandbox::{Budgets, CacheOptions, Control};
 
     const MAX_REQUEST: usize = 64 * 1024 * 1024;
@@ -116,7 +118,25 @@ mod process {
                 },
             )
             .map_err(|error| ("trap", format!("{error:#}")))
-            .and_then(|runtime| sandbox::run(&runtime, &module, &input, &request.limits, control)),
+            .and_then(|runtime| {
+                let maximum = request.limits.max_callback_output.saturating_add(1024);
+                let dispatch: callbacks::Dispatch = Box::new(move |bytes| {
+                    let mut output = io::stdout().lock();
+                    write_frame(&mut output, br#""callback""#)?;
+                    write_frame(&mut output, bytes)?;
+                    output.flush()?;
+                    drop(output);
+                    read_frame(&mut io::stdin(), &mut maximum.clone())
+                });
+                sandbox::run_with_callbacks(
+                    &runtime,
+                    &module,
+                    &input,
+                    &request.limits,
+                    control,
+                    Some(dispatch),
+                )
+            }),
             _ => Err(("worker_error", "unknown worker operation".into())),
         };
         response(result, maximum)
@@ -126,6 +146,14 @@ mod process {
         let deadline = Instant::now() + Duration::from_millis(timeout);
         let mut input = io::stdin();
         let request = request(&mut input)?;
+        let limits: Request = serde_json::from_slice(&request[0])?;
+        let max_callback_input = limits.limits.max_callback_input.min(MAX_REQUEST);
+        let max_callback_output = limits
+            .limits
+            .max_callback_output
+            .min(MAX_REQUEST)
+            .saturating_add(1024);
+        let max_callback_calls = limits.limits.max_callback_calls;
         let mut child = Command::new(std::env::current_exe()?)
             .args([
                 "--child".to_owned(),
@@ -145,26 +173,68 @@ mod process {
         std::thread::spawn(move || {
             let result = request
                 .iter()
-                .try_for_each(|bytes| write_frame(&mut child_input, bytes));
-            drop(child_input);
+                .try_for_each(|bytes| write_frame(&mut child_input, bytes))
+                .and_then(|_| child_input.flush().map_err(Into::into));
             if result.is_ok() {
-                // Any further byte, EOF, or transport error cancels the child.
-                let _ = input.read(&mut [0]);
+                // Only explicit reply frames can reach the restricted child.
+                // Cancellation, EOF, malformed/oversized replies all kill it.
+                loop {
+                    let mut command = [0];
+                    if input.read_exact(&mut command).is_err() || command[0] != 2 {
+                        break;
+                    }
+                    let Ok(bytes) = read_frame(&mut input, &mut max_callback_output.clone()) else {
+                        break;
+                    };
+                    if write_frame(&mut child_input, &bytes).is_err()
+                        || child_input.flush().is_err()
+                    {
+                        break;
+                    }
+                }
             }
             signal.store(true, Ordering::Release);
         });
         let overflow = Arc::new(AtomicBool::new(false));
         let signal = overflow.clone();
-        let output = child.stdout.take().unwrap();
+        let mut output = child.stdout.take().unwrap();
         let reader = std::thread::spawn(move || {
-            // Never forward the child's stdout directly to BEAM. This bound still
-            // holds if a native-code escape writes outside the WASI output buffers.
-            let mut bytes = Vec::new();
-            let result = output
-                .take((maximum + 4096 + 1) as u64)
-                .read_to_end(&mut bytes);
-            signal.store(bytes.len() > maximum + 4096, Ordering::Release);
-            (result, bytes)
+            // Validate and bound each frame before forwarding callback requests.
+            // Final results are withheld until the child exits successfully.
+            let result = (|| -> anyhow::Result<Vec<u8>> {
+                let mut calls = 0;
+                loop {
+                    let header = read_frame(&mut output, &mut 4096)?;
+                    let kind: String = serde_json::from_slice(&header)?;
+                    let callback = kind == "callback";
+                    let limit = if callback {
+                        max_callback_input
+                    } else {
+                        maximum
+                    };
+                    let bytes = read_frame(&mut output, &mut limit.clone())?;
+                    if callback {
+                        calls += 1;
+                        anyhow::ensure!(
+                            calls <= max_callback_calls,
+                            "callback call limit exceeded"
+                        );
+                        let mut host = io::stdout().lock();
+                        write_frame(&mut host, &header)?;
+                        write_frame(&mut host, &bytes)?;
+                        host.flush()?;
+                    } else {
+                        let mut final_result = Vec::new();
+                        write_frame(&mut final_result, &header)?;
+                        write_frame(&mut final_result, &bytes)?;
+                        // Bound even trailing garbage from a compromised child.
+                        anyhow::ensure!(output.read(&mut [0])? == 0, "trailing worker output");
+                        return Ok(final_result);
+                    }
+                }
+            })();
+            signal.store(result.is_err(), Ordering::Release);
+            result
         });
         let status = loop {
             if let Some(status) = child.try_wait()? {
@@ -187,13 +257,9 @@ mod process {
             std::thread::sleep(Duration::from_millis(2));
         };
         if status == 0 {
-            let (result, bytes) = reader
+            let bytes = reader
                 .join()
-                .map_err(|_| anyhow::anyhow!("IPC reader failed"))?;
-            result?;
-            if bytes.len() > maximum + 4096 {
-                return Ok(126);
-            }
+                .map_err(|_| anyhow::anyhow!("IPC reader failed"))??;
             io::stdout().write_all(&bytes)?;
         }
         Ok(status)

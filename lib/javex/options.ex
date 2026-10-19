@@ -12,6 +12,12 @@ defmodule Javex.Options do
     max_stderr: 64 * 1024,
     max_module: 8 * 1024 * 1024
   }
+  @callback_defaults %{
+    callback_timeout: 1_000,
+    max_callback_calls: 32,
+    max_callback_input: 65_536,
+    max_callback_output: 262_144
+  }
   @runtime_keys Map.new(@defaults, fn {key, _} ->
                   {String.to_atom("default_#{key}"), key}
                 end)
@@ -51,14 +57,20 @@ defmodule Javex.Options do
   end
 
   def run(opts, defaults) do
-    with :ok <- keywords(opts, Map.keys(@defaults) ++ [:runtime, :encoding, :env]),
-         limits = Map.merge(defaults, Map.new(Keyword.take(opts, Map.keys(@defaults)))),
+    budget_defaults = Map.merge(defaults, @callback_defaults)
+
+    with :ok <-
+           keywords(opts, Map.keys(budget_defaults) ++ [:runtime, :encoding, :env, :callbacks]),
+         limits =
+           Map.merge(budget_defaults, Map.new(Keyword.take(opts, Map.keys(budget_defaults)))),
          :ok <- budgets(limits),
+         callbacks = Keyword.get(opts, :callbacks, %{}),
+         :ok <- callbacks(callbacks),
          encoding = Keyword.get(opts, :encoding, :json),
          :ok <- member(:encoding, encoding, [:json, :raw]),
          env = Keyword.get(opts, :env, []),
          :ok <- environment(env) do
-      {:ok, Map.merge(limits, %{encoding: encoding, env: env})}
+      {:ok, Map.merge(limits, %{encoding: encoding, env: env, callbacks: callbacks})}
     end
   end
 
@@ -85,8 +97,23 @@ defmodule Javex.Options do
   end
 
   def native(limits, mode) do
-    limits |> Map.drop([:timeout, :encoding]) |> Map.put(:static_mode, mode == :static)
+    limits
+    |> Map.drop([:timeout, :encoding, :callbacks, :callback_timeout, :deadline])
+    |> Map.put(:static_mode, mode == :static)
   end
+
+  defp callbacks(callbacks) when is_map(callbacks) and not is_struct(callbacks) do
+    if Enum.all?(callbacks, fn {name, callback} ->
+         is_binary(name) && byte_size(name) in 1..128 && String.valid?(name) &&
+           is_function(callback, 2)
+       end) do
+      :ok
+    else
+      invalid("callbacks must map UTF-8 names of 1–128 bytes to functions of arity 2")
+    end
+  end
+
+  defp callbacks(_), do: invalid("callbacks must be a map")
 
   defp keywords(opts, allowed) do
     if Keyword.keyword?(opts) && Enum.all?(Keyword.keys(opts), &(&1 in allowed)) &&
@@ -101,7 +128,7 @@ defmodule Javex.Options do
 
   defp budgets(limits) do
     Enum.reduce_while(limits, :ok, fn {key, value}, :ok ->
-      minimum = if key in [:fuel, :max_output, :max_stderr], do: 0, else: 1
+      minimum = if key in [:fuel, :max_output, :max_stderr, :max_callback_calls], do: 0, else: 1
 
       case integer(key, value, minimum) do
         :ok -> {:cont, :ok}
@@ -114,6 +141,8 @@ defmodule Javex.Options do
     maximum =
       case key do
         :timeout -> 2_147_483_647
+        :callback_timeout -> 2_147_483_647
+        key when key in [:max_callback_input, :max_callback_output] -> 64 * 1024 * 1024
         :max_process_memory -> 9_223_372_036_854_775_807
         _ -> 18_446_744_073_709_551_615
       end

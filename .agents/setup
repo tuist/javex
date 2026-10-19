@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+if ! command -v mise >/dev/null 2>&1; then
+  curl -fsSL https://mise.run | sh
+fi
+
+mise trust
+mise install
+mise reshim
+mise exec -- mix local.hex --force
+mise exec -- mix deps.get
+
+# Amp and supervised services start in new login shells after setup finishes.
+if ! grep -Fqx '# Javex orb toolchains' "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'PROFILE'
+
+# Javex orb toolchains
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"
+export JAVEX_BUILD=1
+export CARGO_BUILD_JOBS=1
+PROFILE
+fi

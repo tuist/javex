@@ -61,6 +61,104 @@ Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify({hello: "world"})))
 
 Persisting compiled modules? `%Javex.Module{}` is a plain struct — `:erlang.term_to_binary/1` round-trips it, no helper needed.
 
+## 🔌 Elixir callbacks and HTTP
+
+Grant named callbacks **per execution**, on either backend:
+
+```elixir
+{:ok, mod} = Javex.compile(~S"""
+const response = Javex.Host.call("http.request", {path: "/status"});
+Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(response)));
+""")
+
+Javex.run(mod, nil,
+  callbacks: %{"http.request" => &MyApp.ScriptHTTP.request/2},
+  timeout: 5_000,
+  callback_timeout: 1_000,
+  max_callback_calls: 8,
+  max_callback_input: 65_536,
+  max_callback_output: 262_144
+)
+```
+
+Callbacks receive `(argument, %{deadline: absolute_monotonic_milliseconds})` and
+return `{:ok, json_value}` or
+`{:error, %{"code" => "unavailable", "message" => "Try later"}}`.
+Use string-keyed maps, lists, UTF-8 strings, numbers, booleans and `nil`; structs
+and other atoms are rejected. JS uses normal JSON/number precision rules; encode
+binary explicitly, for example with base64. Callback names are UTF-8 strings of
+1–128 bytes. No callbacks are granted by default, and grants never persist.
+
+HTTP belongs in your application. For example, with [Req](https://hexdocs.pm/req)
+as an **application dependency** (Javex does not depend on it):
+
+```elixir
+defmodule MyApp.ScriptHTTP do
+  # Fixed origin and explicit operation: JS cannot choose URLs or credentials.
+  def request(%{"path" => "/status"}, %{deadline: deadline}) do
+    remaining = max(deadline - System.monotonic_time(:millisecond), 1)
+    token = Application.fetch_env!(:my_app, :service_token)
+
+    into = fn {:data, chunk}, {req, resp} ->
+      body = resp.body || ""
+
+      if byte_size(body) + byte_size(chunk) > 65_536 do
+        {:halt, {req, Req.Response.put_private(resp, :too_large, true)}}
+      else
+        {:cont, {req, %{resp | body: body <> chunk}}}
+      end
+    end
+
+    case Req.get("https://api.example.com/status",
+           auth: {:bearer, token},
+           redirect: false,
+           retry: false,
+           compressed: false,
+           decode_body: false,
+           receive_timeout: remaining,
+           into: into
+         ) do
+      {:ok, response} ->
+        if Req.Response.get_private(response, :too_large, false) do
+          {:error, %{"code" => "body_limit", "message" => "Response too large"}}
+        else
+          {:ok, %{"status" => response.status, "body" => response.body}}
+        end
+
+      {:error, _} ->
+        {:error, %{"code" => "unavailable", "message" => "Service unavailable"}}
+    end
+  end
+
+  def request(_, _), do: {:error, %{"code" => "denied", "message" => "Operation not allowed"}}
+end
+```
+
+Calls are synchronous, not `fetch` or promises: JS waits while Elixir performs
+the operation. Ordinary HTTP statuses are callback data. Declared errors throw
+a catchable JS `HostError` with `code` and `message`; missing grants throw
+`callback_denied`. Callback exceptions/exits/invalid results throw a sanitized
+`callback_failed`, without host stack traces or exception messages.
+
+Callbacks run in separate monitored Elixir processes. They include JSON encoding
+in their deadline and stop on timeout, caller death or runtime shutdown. They do
+not block the runtime GenServer or occupy dirty CPU schedulers while waiting.
+Cancellation cannot undo external effects, and independently spawned HTTP work
+needs its own cancellation. The isolated child still has no network access;
+only the host callback performs the request.
+
+Defaults are 32 call attempts, 1,000 ms per callback, 64 KiB per encoded request
+(including its name/argument envelope), and 256 KiB per encoded result/error
+(excluding transport framing). Byte budgets are positive and at most 64 MiB.
+Zero call attempts disables callbacks. These budgets are separate from stdin/
+stdout, and callback time also counts toward the run deadline. Exceeding them
+terminates the run with `:callback_limit` or `:callback_timeout`, even inside JS
+`try/catch`. Fuel and guest/process memory limits do **not** constrain Elixir or
+HTTP buffers. Bound response reads/decompression in the HTTP client, not only
+after buffering. If allowing guest-selected URLs, enforce SSRF protections for
+resolved addresses and every redirect. Keep credentials and safe error messages
+in trusted host code. Recompile older persisted modules to use `Javex.Host`.
+
 ## 🛡 Safety knobs
 
 ```elixir
@@ -155,7 +253,8 @@ and cold compilation costs apply on every call. IPC requests/responses have a
   cancelled native work retains its admission slot until it actually stops.
 - Only stdin, bounded stdout/stderr and explicitly supplied WASI `env` pairs
   are configured. The host environment is never inherited, no filesystem
-  directories are preopened, and no network capability is granted.
+  directories are preopened, and no network capability is granted inside Wasm.
+  A private callback channel exposes only explicitly granted Elixir callbacks.
 - The bundled JavaScript API provides synchronous `Javy.IO`, TextEncoder and
   TextDecoder, and standard QuickJS intrinsics. It is **not Node or Deno**:
   there is no `fetch`, filesystem/path API, external module loading, timers,
@@ -185,23 +284,35 @@ layer above it. Do not execute agent-generated JS as trusted Elixir host code.
 
 ### Bundled provider provenance
 
-`priv/javy_plugin.wasm` is the initialized default provider from
-[Javy v8.1.1](https://github.com/bytecodealliance/javy/releases/tag/v8.1.1), using
-namespace `javy-default-plugin-v3`. The bundled bytes match the decompressed
-official `plugin.wasm.gz` asset exactly. Reproduce or verify them with:
+`priv/javy_plugin.wasm` is Javex's initialized custom provider, built from
+`native/javex_plugin` with `javy-plugin-api` 6.0.0 (Javy 7.0.0) and initialized
+using the [Javy v8.1.1 CLI](https://github.com/bytecodealliance/javy/releases/tag/v8.1.1).
+It retains the standard synchronous Javy environment and adds `Javex.Host.call`
+through the private `javex_host_v1` Wasm imports. Its provider namespace is
+`javex-plugin-v1`; it is **not** the official default provider binary.
+
+To rebuild on Linux x86_64, install the pinned Rust toolchain, Clang and
+libclang development headers, then:
 
 ```sh
-curl -fL https://github.com/bytecodealliance/javy/releases/download/v8.1.1/plugin.wasm.gz -o /tmp/javy-plugin.wasm.gz
-echo '52e3c83235f7735cb294e119a1a4b7be0a503323d5b8967eff8c0e516f3da8e1  /tmp/javy-plugin.wasm.gz' | sha256sum -c -
-gzip -dc /tmp/javy-plugin.wasm.gz > /tmp/javy-plugin.wasm
-echo '9a1f5310999888e39b7712e43384291cdc8cf84eaa409faf5338959d901ecacc  /tmp/javy-plugin.wasm' | sha256sum -c -
-cmp /tmp/javy-plugin.wasm priv/javy_plugin.wasm
+curl -fL https://github.com/bytecodealliance/javy/releases/download/v8.1.1/javy-x86_64-linux-v8.1.1.gz -o /tmp/javy.gz
+echo '4bec224e1d51827808fd063541a2b4d94cf474744636b692be63e7a29bec83a6  /tmp/javy.gz' | sha256sum -c -
+gzip -dc /tmp/javy.gz > /tmp/javy
+chmod +x /tmp/javy
+JAVY=/tmp/javy native/javex_plugin/build
+
+# Verify the bundled binary independently of rebuilding:
+echo 'dbe33a57dd668daaa8f09fa63392674b86d14ec229eceb838625f31aeca01672  priv/javy_plugin.wasm' | sha256sum -c -
 ```
 
+Building the provider is a maintainer task, not an installation requirement.
+The build uses the checked-in Cargo lockfile and deterministic initialization.
 Provider changes require compatibility tests and recompilation of dynamic
-modules. Custom providers must be trusted, initialized Javy providers supporting
-the same `cabi_realloc` / `compile-src` / `invoke` ABI; the namespace alone does
-not establish compatibility or trust.
+modules; modules compiled with the previous default provider must be recompiled.
+Other custom providers must be trusted, initialized Javy providers supporting
+the same `cabi_realloc` / `compile-src` / `invoke` ABI; they do not automatically
+gain the JS callback API. The namespace alone does not establish compatibility
+or trust.
 
 ## Development and verification
 
@@ -212,6 +323,7 @@ JAVEX_BUILD=1 mix test --cover
 mix format --check-formatted
 JAVEX_BUILD=1 mix credo --strict
 cargo fmt --manifest-path native/javex_nif/Cargo.toml --check
+cargo fmt --manifest-path native/javex_plugin/Cargo.toml --check
 cargo clippy --manifest-path native/javex_nif/Cargo.toml --all-targets --locked -- -D warnings
 cargo test --manifest-path native/javex_nif/Cargo.toml --release --locked
 ```

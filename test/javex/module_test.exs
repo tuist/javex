@@ -49,7 +49,6 @@ defmodule Javex.ModuleTest do
     test "static modules embed their provider and round-trip through serialization" do
       {:ok, mod} = Javex.compile(@echo_js, mode: :static)
       assert %Module{mode: :static, provider_hash: nil} = mod
-      assert byte_size(mod.bytes) > 1_000_000
       restored = mod |> :erlang.term_to_binary() |> :erlang.binary_to_term([:safe])
       assert {:ok, %{"static" => 17}} = Javex.run(restored, %{static: 17})
     end

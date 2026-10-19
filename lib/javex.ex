@@ -90,6 +90,17 @@ defmodule Javex do
     * `:max_stderr` - diagnostic byte cap. Default 64 KiB.
     * `:max_module` - input Wasm byte cap. Default 8 MiB.
     * `:env` - explicit WASI environment; host environment is never inherited.
+    * `:callbacks` - per-run map of UTF-8 names (1–128 bytes) to Elixir functions
+      of arity 2. Defaults to `%{}` (no host access). See "Host callbacks" below.
+    * `:callback_timeout` - maximum time per callback in milliseconds, also
+      bounded by the run deadline. Default `1_000`.
+    * `:max_callback_calls` - maximum callback attempts per run. Default `32`;
+      zero disables callbacks, including denied attempts.
+    * `:max_callback_input` - maximum encoded JSON request bytes per callback,
+      including the name and argument envelope. Default 64 KiB.
+    * `:max_callback_output` - maximum encoded JSON result or declared error
+      bytes per callback, excluding the transport envelope. Default 256 KiB.
+      Callback byte budgets must be positive and at most 64 MiB each.
 
   Limits must be finite non-negative integers; memory, input, module and timeout
   must be positive. Invalid options return an error. Saturated runtimes return
@@ -105,6 +116,48 @@ defmodule Javex do
   disposable, killable OS-restricted workers. Also pass that runtime to
   `compile/2`; standalone compilation remains in-process. Host-side JSON
   encoding/decoding is outside the worker's address-space limit.
+
+  ## Host callbacks
+
+  JavaScript compiled with Javex can call `Javex.Host.call(name, argument)`.
+  Only callbacks supplied to this execution are accessible, on either backend:
+
+      callbacks = %{
+        "lookup" => fn %{"id" => id}, %{deadline: deadline} ->
+          MyApp.lookup(id, deadline: deadline)
+        end
+      }
+
+      Javex.run(mod, input, callbacks: callbacks)
+
+  Each function receives a JSON argument and `%{deadline: deadline}`, where
+  `deadline` is an absolute `System.monotonic_time(:millisecond)` deadline.
+  It returns `{:ok, value}` or
+  `{:error, %{"code" => "unavailable", "message" => "Try later"}}`.
+  Values must be JSON-compatible: string-keyed maps, lists, UTF-8 strings,
+  numbers, booleans or `nil`; no structs or other atoms. JavaScript numbers
+  have their usual safe-integer/precision limits. Use explicit base64 for bytes.
+
+  Calls are synchronous: JavaScript waits for Elixir, without a Promise loop.
+  Declared errors throw a catchable `HostError` with `code` and `message`.
+  Unknown names throw `callback_denied`; exceptions, exits, throws and invalid
+  results become sanitized `callback_failed` errors. Uncaught errors fail the
+  run as `:js_error`. Callback quota violations and callback deadlines terminate
+  the run as `:callback_limit` and `:callback_timeout`; JS cannot catch them.
+
+  Callbacks execute in separate monitored Elixir processes, outside the runtime
+  GenServer. Their execution and JSON encoding count toward the run deadline.
+  Timeout, caller death and runtime shutdown stop the callback process; admission
+  is retained until it and native execution stop. Work independently spawned by
+  a callback needs its own cancellation. External effects cannot be rolled back.
+  Fuel and guest/process memory limits do not meter Elixir code or HTTP buffers.
+
+  For HTTP, register an application callback using your HTTP client. Keep
+  credentials in host code, allowlist destinations/methods, validate redirects
+  and resolved addresses, and bound reads/decompression before buffering bodies.
+  No networking is enabled inside the isolated worker. See the README example.
+  Callbacks do not make guest-selected Elixir module/function names callable.
+  Persisted modules compiled before this API must be recompiled to use it.
 
   ## Examples
 

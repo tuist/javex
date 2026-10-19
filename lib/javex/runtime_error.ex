@@ -14,6 +14,8 @@ defmodule Javex.RuntimeError do
     * `:invalid_options` - malformed options or module metadata.
     * `:busy` - the runtime's bounded worker capacity is occupied.
     * `:cancelled` - the execution was cancelled.
+    * `:callback_limit` - a callback call-count or encoded byte budget was exceeded.
+    * `:callback_timeout` - a callback exceeded its wall-clock budget.
     * `:runtime_down` - the runtime is unavailable or stopped during the call.
     * `:worker_error` - the isolated OS worker crashed or could not enforce its policy.
     * `:unknown` - anything else, with the raw reason stringified.
@@ -33,6 +35,8 @@ defmodule Javex.RuntimeError do
           | :invalid_options
           | :busy
           | :cancelled
+          | :callback_limit
+          | :callback_timeout
           | :runtime_down
           | :worker_error
 

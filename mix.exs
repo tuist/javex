@@ -51,6 +51,11 @@ defmodule Javex.MixProject do
         native/javex_nif/Cargo.toml
         native/javex_nif/Cargo.lock
         native/javex_nif/.cargo
+        native/javex_plugin/src
+        native/javex_plugin/Cargo.toml
+        native/javex_plugin/Cargo.lock
+        native/javex_plugin/.cargo
+        native/javex_plugin/build
         priv/javy_plugin.wasm
         checksum-*.exs
         mix.exs

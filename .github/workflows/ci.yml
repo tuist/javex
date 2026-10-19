@@ -53,6 +53,8 @@ jobs:
           rustup component add rustfmt clippy
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets --no-default-features --features nif_version_2_16 -- -D warnings
+      - name: Provider source formatting
+        run: cargo fmt --manifest-path native/javex_plugin/Cargo.toml --check
 
   advisories:
     name: Dependency advisories (Hex + RustSec)
@@ -71,6 +73,7 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit --file native/javex_nif/Cargo.lock
+          cargo audit --file native/javex_plugin/Cargo.lock
 
   compile:
     name: Compile without warnings

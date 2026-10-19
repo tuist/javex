@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use crate::callbacks::{Callbacks, Dispatch};
 use crate::output::Output;
 use rustler::NifMap;
 use sha2::{Digest, Sha256};
@@ -191,6 +192,9 @@ pub struct Budgets {
     pub max_output: usize,
     pub max_stderr: usize,
     pub max_module: usize,
+    pub max_callback_calls: u64,
+    pub max_callback_input: usize,
+    pub max_callback_output: usize,
     pub env: Vec<(String, String)>,
     pub static_mode: bool,
 }
@@ -245,6 +249,8 @@ impl ResourceLimiter for Limiter {
 pub(crate) struct StoreContext {
     wasi: WasiP1Ctx,
     limiter: Limiter,
+    pub(crate) callbacks: Callbacks,
+    pub(crate) control: Control,
 }
 
 pub(crate) struct Sandbox {
@@ -277,6 +283,8 @@ impl Sandbox {
         }
         let ctx = StoreContext {
             wasi: wasi.build_p1(),
+            callbacks: Callbacks::new(opts, None),
+            control: control.clone(),
             limiter: Limiter {
                 limits: StoreLimitsBuilder::new()
                     .memory_size(opts.max_memory)
@@ -308,6 +316,7 @@ impl Sandbox {
     pub(crate) fn linker(engine: &Engine) -> anyhow::Result<Linker<StoreContext>> {
         let mut linker = Linker::new(engine);
         p1::add_to_linker_sync(&mut linker, |state: &mut StoreContext| &mut state.wasi)?;
+        crate::callbacks::add_to_linker(&mut linker)?;
         Ok(linker)
     }
 
@@ -317,6 +326,9 @@ impl Sandbox {
         }
         if Instant::now() >= self.control.deadline {
             return Err(("timeout", "execution timed out".into()));
+        }
+        if let Some(failure) = &self.store.data().callbacks.failure {
+            return Err(failure.clone());
         }
         if self.store.data().limiter.exceeded {
             return Err(("oom", "guest memory or table limit exceeded".into()));
@@ -353,6 +365,17 @@ pub fn run(
     opts: &Budgets,
     control: Control,
 ) -> Result<Vec<u8>, (&'static str, String)> {
+    run_with_callbacks(runtime, wasm, input, opts, control, None)
+}
+
+pub fn run_with_callbacks(
+    runtime: &Runtime,
+    wasm: &[u8],
+    input: &[u8],
+    opts: &Budgets,
+    control: Control,
+    dispatch: Option<Dispatch>,
+) -> Result<Vec<u8>, (&'static str, String)> {
     if input.len() > opts.max_input {
         return Err(("input_limit", "input limit exceeded".into()));
     }
@@ -361,6 +384,7 @@ pub fn run(
     }
     let mut sandbox = Sandbox::new(&runtime.engine, input, opts, control.clone())
         .map_err(|error| ("trap", error.to_string()))?;
+    sandbox.store.data_mut().callbacks = Callbacks::new(opts, dispatch);
     let result = (|| -> anyhow::Result<()> {
         control.check()?;
         let key: [u8; 32] = Sha256::digest(wasm).into();

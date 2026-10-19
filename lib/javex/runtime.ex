@@ -31,7 +31,16 @@ defmodule Javex.Runtime do
 
   use GenServer
 
-  alias Javex.{IncompatibleProviderError, Isolated, Module, Native, Options, Plugin, RuntimeError}
+  alias Javex.{
+    Callbacks,
+    IncompatibleProviderError,
+    Isolated,
+    Module,
+    Native,
+    Options,
+    Plugin,
+    RuntimeError
+  }
 
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
@@ -95,6 +104,8 @@ defmodule Javex.Runtime do
   def handle_call({:run, mod, input, opts, started}, from, state) do
     with {:ok, limits} <- Options.run(opts, state.defaults),
          :ok <- check_module(mod, state, limits) do
+      limits = Map.put(limits, :deadline, started + limits.timeout)
+
       start_job(from, started, limits.timeout, state, fn control, server, remaining ->
         execute(state, mod, input, %{limits | timeout: remaining}, control, server)
       end)
@@ -226,6 +237,11 @@ defmodule Javex.Runtime do
 
   defp run_native(%{backend: :isolated} = state, mod, input, limits, _control, server) do
     Isolated.run(state.plugin, mod, input, limits, state.max_process_memory, server)
+  end
+
+  defp run_native(state, mod, input, %{callbacks: callbacks} = limits, control, server)
+       when map_size(callbacks) > 0 do
+    Callbacks.native(state.native, mod, input, limits, control, server)
   end
 
   defp run_native(state, mod, input, limits, control, _server) do
