@@ -28,6 +28,11 @@ defmodule Javex do
 
   @type input :: map() | list() | binary() | number() | boolean() | nil
   @type output :: map() | list() | binary() | number() | boolean() | nil
+  @type json ::
+          %{optional(String.t()) => json()} | [json()] | String.t() | number() | boolean() | nil
+  @type callback ::
+          (json(), %{deadline: integer()} ->
+             {:ok, json()} | {:error, %{required(String.t()) => String.t()}})
 
   @doc """
   Compile a JavaScript source string into a `Javex.Module`.
@@ -90,26 +95,76 @@ defmodule Javex do
     * `:max_stderr` - diagnostic byte cap. Default 64 KiB.
     * `:max_module` - input Wasm byte cap. Default 8 MiB.
     * `:env` - explicit WASI environment; host environment is never inherited.
+    * `:callbacks` - per-run map of UTF-8 names to arity-2 Elixir functions.
+      Defaults to `%{}` (no capabilities). See "Host callbacks" below.
+    * `:max_callback_calls` - total callback attempts. Default 32; maximum 1024.
+      Zero denies all attempts.
+    * `:max_callback_concurrency` - outstanding JS host calls. Default 4;
+      maximum 1024. Exceeding it fails rather than queueing unbounded work.
+    * `:callback_timeout` - milliseconds per callback, including encoding its
+      result. Default 1_000; also bounded by the remaining run deadline.
+    * `:max_callback_input`, `:max_callback_output` - encoded JSON bytes per
+      argument and result/error, separate from stdin/stdout. Defaults 64 KiB
+      and 256 KiB; maximum 8 MiB each.
 
   Limits must be finite non-negative integers; memory, input, module and timeout
   must be positive. Invalid options return an error. Saturated runtimes return
   `:busy`. Caller death cancels execution. These options are controlled by trusted
   host code, not by the JS author.
 
-  The bundled JS environment supports synchronous `Javy.IO` and text encoding;
-  it does not provide Node, Deno, fetch, timers, external module loading, or a
-  Promise event loop. No host filesystem is preopened. Clocks and randomness
-  are not deterministic. `max_memory` is not an OS process/RSS limit. For
+  The bundled JS environment supports synchronous `Javy.IO`, text encoding,
+  Promises and top-level `await`; it does not provide Node, Deno, fetch, timers,
+  or external module loading. No host filesystem is preopened. Runtime clocks
+  are not deterministic; snapshot-seeded `Math.random` can repeat across instances
+  and is not cryptographically secure. `max_memory` is not an OS process/RSS limit. For
   untrusted code, start a Linux runtime with `backend: :isolated` and a finite
   `max_process_memory`: native parsing, compilation and execution then run in
   disposable, killable OS-restricted workers. Also pass that runtime to
   `compile/2`; standalone compilation remains in-process. Host-side JSON
   encoding/decoding is outside the worker's address-space limit.
 
+  ## Host callbacks
+
+  JavaScript calls `await Javex.Host.call("name", argument)`. `Promise.all`
+  runs independent callbacks concurrently on both backends. Registration grants
+  only that name for this run; callbacks are never inherited from other runs.
+  Names are non-empty strings of at most 128 UTF-8 bytes, with at most 128 grants.
+
+  A callback receives one decoded JSON value and `%{deadline: deadline}`, an
+  absolute `System.monotonic_time(:millisecond)` deadline. It returns
+  `{:ok, json}` or `{:error, %{"code" => code, "message" => safe_message}}`.
+  Objects must have string keys; structs, tuples, atoms other than booleans/nil,
+  and non-JSON values are rejected. Use strings for integers outside JavaScript's
+  safe-integer range, and an explicit base64 convention for binary data.
+
+  Declared errors reject the JS Promise with an Error named `HostError` and a
+  `code` property. Unknown names reject with `capability_denied`; crashes and
+  invalid returns reject with sanitized `callback_failed` errors. A rejection
+  propagated to the root module fails the run with `:js_error`. Callback limits
+  and callback timeouts terminate the run with `:callback_limit` and
+  `:callback_timeout`, even if JS catches an exception. The overall deadline
+  remains `:timeout`.
+
+  Await all work that must finish: execution ends when the root module evaluation
+  settles, and cancels remaining callbacks before returning. Caller death and
+  runtime shutdown cancel callbacks too. Callback code runs in monitored Elixir
+  processes, outside the Wasm/process memory limits. Host code must bound HTTP
+  bodies while reading, propagate deadlines to its HTTP client, and cancel any
+  separately owned work. Cancellation cannot undo external side effects.
+
+  HTTP clients, credentials and destination/method policy belong in callbacks,
+  not the guest or Javex core. Never grant an unrestricted HTTP proxy to untrusted
+  JS. Custom providers need the Javex resumable ABI to expose `Javex.Host`;
+  legacy providers retain their existing synchronous execution behavior.
+
   ## Examples
 
       {:ok, %{"sum" => 3}} = Javex.run(mod, %{a: 1, b: 2})
       {:ok, bytes}         = Javex.run(mod, "raw in", encoding: :raw)
+
+      Javex.run(mod, nil,
+        callbacks: %{"http.request" => &MyApp.HTTP.request/2}
+      )
   """
   @spec run(Module.t(), input(), keyword()) :: {:ok, output()} | {:error, term()}
   def run(%Module{} = mod, input, opts \\ []) do

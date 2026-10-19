@@ -16,6 +16,8 @@ defmodule Javex.RuntimeError do
     * `:cancelled` - the execution was cancelled.
     * `:runtime_down` - the runtime is unavailable or stopped during the call.
     * `:worker_error` - the isolated OS worker crashed or could not enforce its policy.
+    * `:callback_limit` - a callback call/concurrency/JSON byte budget was exceeded.
+    * `:callback_timeout` - an individual host callback exceeded its deadline.
     * `:unknown` - anything else, with the raw reason stringified.
   """
 
@@ -35,6 +37,8 @@ defmodule Javex.RuntimeError do
           | :cancelled
           | :runtime_down
           | :worker_error
+          | :callback_limit
+          | :callback_timeout
 
   @type t :: %__MODULE__{kind: kind(), message: String.t()}
 

@@ -1,11 +1,11 @@
 defmodule Javex.Isolated do
   @moduledoc false
 
-  alias Javex.Options
+  alias Javex.{Callbacks, Options}
 
   @max_transport 64 * 1024 * 1024
   @kinds Map.new(
-           ~w(timeout cancelled fuel_exhausted oom js_error trap output_limit diagnostic_limit input_limit module_limit compile_error worker_error),
+           ~w(timeout cancelled fuel_exhausted oom js_error trap output_limit diagnostic_limit input_limit module_limit compile_error worker_error callback_limit callback_timeout),
            &{&1, String.to_atom(&1)}
          )
 
@@ -19,24 +19,24 @@ defmodule Javex.Isolated do
     end
   end
 
-  def run(plugin, mod, input, limits, memory, owner) do
-    call("run", plugin, mod.bytes, input, mod.mode, limits, memory, owner)
+  def run(plugin, mod, input, limits, memory, owner, broker) do
+    call("run", [plugin, mod.bytes, input], mod.mode, limits, memory, owner, broker)
   end
 
   def compile(plugin, source, mode, limits, memory, owner) do
-    with {:ok, bytes} <- call("compile", plugin, source, <<>>, mode, limits, memory, owner) do
+    with {:ok, bytes} <- call("compile", [plugin, source, <<>>], mode, limits, memory, owner, nil) do
       {:ok, {bytes, if(mode == :dynamic, do: :crypto.hash(:sha256, plugin), else: <<>>)}}
     end
   end
 
-  defp call(operation, plugin, module, input, mode, limits, memory, owner) do
+  defp call(operation, payloads, mode, limits, memory, owner, broker) do
     budgets =
       limits
       |> Options.native(mode)
       |> Map.update!(:env, &Enum.map(&1, fn {key, value} -> [key, value] end))
 
     header = Jason.encode!(%{operation: operation, limits: budgets})
-    frames = [header, plugin, module, input]
+    frames = [header | payloads]
 
     maximum =
       min(max(limits.max_module, max(limits.max_output, limits.max_stderr)), @max_transport)
@@ -58,7 +58,29 @@ defmodule Javex.Isolated do
 
       try do
         Port.command(port, Enum.map(frames, &[<<byte_size(&1)::32>>, &1]))
-        receive_result(port, monitor, [], 0, maximum + 4096, false)
+
+        max_frame =
+          min(
+            @max_transport,
+            max(
+              maximum,
+              limits.max_callback_concurrency * (6 * limits.max_callback_input + 2048) + 4096
+            )
+          )
+
+        receive_result(port, monitor, %{
+          buffer: <<>>,
+          size: 0,
+          maximum: max_frame,
+          output_limit: if(operation == "run", do: limits.max_output, else: limits.max_module),
+          error_limit: max(4096, limits.max_stderr),
+          broker: broker,
+          broker_monitor: if(broker, do: elem(broker, 1)),
+          token: if(broker, do: elem(broker, 2)),
+          result: nil,
+          failure: nil,
+          cancelled: false
+        })
       after
         Process.demonitor(monitor, [:flush])
         if Port.info(port), do: Port.close(port)
@@ -68,44 +90,112 @@ defmodule Javex.Isolated do
     error -> {:error, {:worker_error, "isolated worker unavailable: #{Exception.message(error)}"}}
   end
 
-  defp receive_result(port, monitor, chunks, size, maximum, cancelled) do
+  defp receive_result(port, monitor, state) do
+    token = state.token
+    broker_monitor = state.broker_monitor
+
     receive do
-      {^port, {:data, bytes}} when size + byte_size(bytes) <= maximum ->
-        receive_result(
-          port,
-          monitor,
-          [bytes | chunks],
-          size + byte_size(bytes),
-          maximum,
-          cancelled
-        )
+      {^port, {:data, bytes}} when state.size + byte_size(bytes) <= @max_transport ->
+        state = %{state | buffer: state.buffer <> bytes, size: state.size + byte_size(bytes)}
+
+        case decode_events(state) do
+          {:ok, state} -> receive_result(port, monitor, state)
+          {:error, _} = error -> cancel(port, monitor, %{state | failure: error, buffer: <<>>})
+        end
 
       {^port, {:data, _bytes}} ->
-        {:error, {:worker_error, "isolated worker exceeded IPC response limit"}}
-
-      {^port, {:exit_status, 0}} ->
-        chunks |> Enum.reverse() |> IO.iodata_to_binary() |> decode_response()
-
-      {^port, {:exit_status, 124}} ->
-        {:error, {:timeout, "isolated worker timed out"}}
-
-      {^port, {:exit_status, 125}} ->
-        {:error, {:cancelled, "isolated worker cancelled"}}
+        cancel(port, monitor, %{
+          state
+          | failure: {:error, {:worker_error, "isolated worker exceeded IPC response limit"}},
+            buffer: <<>>
+        })
 
       {^port, {:exit_status, status}} ->
-        {:error, {:worker_error, "isolated worker exited (status #{status})"}}
+        state.failure || worker_result(state, status)
 
       :cancel ->
-        cancel(port, monitor, chunks, size, maximum, cancelled)
+        cancel(port, monitor, state)
 
       {:DOWN, ^monitor, :process, _pid, _reason} ->
-        cancel(port, monitor, chunks, size, maximum, cancelled)
+        cancel(port, monitor, state)
+
+      {:DOWN, ^broker_monitor, :process, _pid, _reason} when not is_nil(broker_monitor) ->
+        cancel(port, monitor, %{
+          state
+          | failure: state.failure || {:error, {:trap, "callback broker stopped"}}
+        })
+
+      {:callback_reply, ^token, completion} when not is_nil(token) ->
+        if !state.cancelled, do: Port.command(port, [<<byte_size(completion)::32>>, completion])
+        receive_result(port, monitor, state)
+
+      {:callback_error, ^token, kind, message} when not is_nil(token) ->
+        cancel(port, monitor, %{state | failure: {:error, {kind, message}}})
     end
   end
 
-  defp cancel(port, monitor, chunks, size, maximum, cancelled) do
-    if !cancelled, do: Port.command(port, <<1>>)
-    receive_result(port, monitor, chunks, size, maximum, true)
+  defp worker_result(state, 0),
+    do: if(state.buffer == <<>> && state.result, do: state.result, else: invalid_response())
+
+  defp worker_result(_state, 124), do: {:error, {:timeout, "isolated worker timed out"}}
+  defp worker_result(_state, 125), do: {:error, {:cancelled, "isolated worker cancelled"}}
+
+  defp worker_result(_state, status),
+    do: {:error, {:worker_error, "isolated worker exited (status #{status})"}}
+
+  defp cancel(port, monitor, state) do
+    if !state.cancelled, do: Port.command(port, <<0::32>>)
+    receive_result(port, monitor, %{state | cancelled: true})
+  end
+
+  defp decode_events(%{buffer: <<length::32, _::binary>>}) when length > 4096,
+    do: invalid_response()
+
+  defp decode_events(%{buffer: <<length::32, rest::binary>>} = state)
+       when byte_size(rest) >= length + 4 do
+    <<header::binary-size(length), size::32, payload::binary>> = rest
+
+    cond do
+      size > state.maximum ->
+        invalid_response()
+
+      byte_size(payload) < size ->
+        {:ok, state}
+
+      state.result ->
+        invalid_response()
+
+      true ->
+        <<bytes::binary-size(size), tail::binary>> = payload
+        handle_event(state, header, bytes, tail)
+    end
+  end
+
+  defp decode_events(state), do: {:ok, state}
+
+  defp handle_event(state, header, bytes, tail) do
+    case Jason.decode(header) do
+      {:ok, "callbacks"} when not is_nil(state.broker) ->
+        if !state.cancelled, do: Callbacks.dispatch(state.broker, bytes)
+        decode_events(%{state | buffer: tail})
+
+      {:ok, "ok"} when byte_size(bytes) > state.output_limit ->
+        invalid_response()
+
+      {:ok, kind} when kind != "ok" and byte_size(bytes) > state.error_limit ->
+        invalid_response()
+
+      {:ok, _} ->
+        result =
+          decode_response(
+            <<byte_size(header)::32, header::binary, byte_size(bytes)::32, bytes::binary>>
+          )
+
+        decode_events(%{state | buffer: tail, result: result})
+
+      _ ->
+        invalid_response()
+    end
   end
 
   defp decode_response(<<length::32, rest::binary>>) when length <= 4096 do

@@ -11,6 +11,11 @@ defmodule Javex.Runtime do
   by `Javex.run/3`. These are defaults, not authorization ceilings; only trusted
   host code should choose options.
 
+  Callback budgets also accept `:default_max_callback_calls`,
+  `:default_max_callback_concurrency`, `:default_callback_timeout`,
+  `:default_max_callback_input`, and `:default_max_callback_output`.
+  Callback grants themselves are always per-run, never runtime defaults.
+
   `:max_concurrency` defaults to 4. Saturation returns `:busy` rather than
   accumulating an unbounded queue. Calls cancelled or timed out retain their
   slot until native work actually stops. `:max_cached_modules` defaults to 64
@@ -31,7 +36,16 @@ defmodule Javex.Runtime do
 
   use GenServer
 
-  alias Javex.{IncompatibleProviderError, Isolated, Module, Native, Options, Plugin, RuntimeError}
+  alias Javex.{
+    Callbacks,
+    IncompatibleProviderError,
+    Isolated,
+    Module,
+    Native,
+    Options,
+    Plugin,
+    RuntimeError
+  }
 
   def start_link(opts \\ []) do
     {name, opts} = Keyword.pop(opts, :name, __MODULE__)
@@ -96,7 +110,8 @@ defmodule Javex.Runtime do
     with {:ok, limits} <- Options.run(opts, state.defaults),
          :ok <- check_module(mod, state, limits) do
       start_job(from, started, limits.timeout, state, fn control, server, remaining ->
-        execute(state, mod, input, %{limits | timeout: remaining}, control, server)
+        limits = Map.put(%{limits | timeout: remaining}, :deadline, started + limits.timeout)
+        execute(state, mod, input, limits, control, server)
       end)
     else
       {:error, _} = error -> {:reply, error, state}
@@ -213,24 +228,66 @@ defmodule Javex.Runtime do
   end
 
   defp execute(state, mod, input, limits, control, server) do
-    with {:ok, input} <- encode(input, limits),
-         {:ok, bytes} <- run_native(state, mod, input, limits, control, server) do
-      decode(bytes, limits.encoding)
-    else
-      {:error, {kind, message}} -> error(kind, message)
-      {:error, _} = error -> error
+    broker = Callbacks.start(limits)
+    owner = Process.monitor(server)
+
+    try do
+      with {:ok, input} <- encode(input, limits),
+           {:ok, bytes} <- run_native(state, mod, input, limits, control, server, broker, owner) do
+        decode(bytes, limits.encoding)
+      else
+        {:error, {kind, message}} -> error(kind, message)
+        {:error, _} = error -> error
+      end
+    after
+      Callbacks.stop(broker)
+      Process.demonitor(owner, [:flush])
     end
   rescue
     exception -> error(:trap, Exception.message(exception))
   end
 
-  defp run_native(%{backend: :isolated} = state, mod, input, limits, _control, server) do
-    Isolated.run(state.plugin, mod, input, limits, state.max_process_memory, server)
+  defp run_native(
+         %{backend: :isolated} = state,
+         mod,
+         input,
+         limits,
+         _control,
+         server,
+         broker,
+         _owner
+       ) do
+    Isolated.run(state.plugin, mod, input, limits, state.max_process_memory, server, broker)
   end
 
-  defp run_native(state, mod, input, limits, control, _server) do
-    Native.run(state.native, mod.bytes, input, Options.native(limits, mod.mode), control)
+  defp run_native(state, mod, input, limits, control, _server, broker, owner) do
+    state.native
+    |> Native.run_start(mod.bytes, input, Options.native(limits, mod.mode), control)
+    |> continue_native(broker, owner)
   end
+
+  defp continue_native({:continue_, execution, requests}, {pid, monitor, token} = broker, owner) do
+    Callbacks.dispatch(broker, requests)
+
+    receive do
+      {:callback_reply, ^token, completion} ->
+        execution |> Native.run_step(completion) |> continue_native(broker, owner)
+
+      {:callback_error, ^token, kind, message} ->
+        {:error, {kind, message}}
+
+      {:DOWN, ^monitor, :process, ^pid, _} ->
+        {:error, {:trap, "callback broker stopped"}}
+
+      {:DOWN, ^owner, :process, _, _} ->
+        {:error, {:cancelled, "runtime stopped"}}
+
+      :cancel ->
+        {:error, {:cancelled, "execution cancelled"}}
+    end
+  end
+
+  defp continue_native(result, _broker, _owner), do: result
 
   defp encode(input, %{encoding: :raw, max_input: max}) when is_binary(input) do
     if byte_size(input) <= max,

@@ -71,6 +71,33 @@ jobs:
         run: |
           cargo install cargo-audit --locked
           cargo audit --file native/javex_nif/Cargo.lock
+          cargo audit --file native/javex_plugin/Cargo.lock
+
+  provider:
+    name: Custom provider build and lint
+    runs-on: tuist-linux
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          experimental: true
+      - name: Install provider build prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang libclang-dev lld wasi-libc
+          rustup target add wasm32-wasip1
+          rustup component add rustfmt clippy
+          curl -fsSL https://github.com/bytecodealliance/javy/releases/download/v8.1.1/javy-x86_64-linux-v8.1.1.gz -o /tmp/javy.gz
+          echo '4bec224e1d51827808fd063541a2b4d94cf474744636b692be63e7a29bec83a6  /tmp/javy.gz' | sha256sum -c -
+          gzip -dc /tmp/javy.gz > /tmp/javy
+          chmod +x /tmp/javy
+      - name: Check and rebuild provider
+        run: |
+          cargo fmt --manifest-path native/javex_plugin/Cargo.toml --check
+          cargo clippy --manifest-path native/javex_plugin/Cargo.toml --locked --target wasm32-wasip1 -- -D warnings
+          cp priv/javy_plugin.wasm /tmp/bundled-provider.wasm
+          PATH="/tmp:$PATH" bash native/javex_plugin/build.sh
+          cmp /tmp/bundled-provider.wasm priv/javy_plugin.wasm
 
   compile:
     name: Compile without warnings

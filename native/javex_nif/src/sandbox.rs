@@ -9,8 +9,8 @@ use crate::output::Output;
 use rustler::NifMap;
 use sha2::{Digest, Sha256};
 use wasmtime::{
-    Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder, Trap,
-    UpdateDeadline,
+    Config, Engine, Instance, Linker, Memory, Module, ResourceLimiter, Store, StoreLimits,
+    StoreLimitsBuilder, Trap, TypedFunc, UpdateDeadline,
 };
 use wasmtime_wasi::WasiCtxBuilder;
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
@@ -183,7 +183,7 @@ pub fn build_runtime(bytes: &[u8], limits: CacheOptions) -> anyhow::Result<Runti
     })
 }
 
-#[derive(NifMap, serde::Deserialize)]
+#[derive(Clone, NifMap, serde::Deserialize)]
 pub struct Budgets {
     pub fuel: u64,
     pub max_memory: usize,
@@ -191,8 +191,32 @@ pub struct Budgets {
     pub max_output: usize,
     pub max_stderr: usize,
     pub max_module: usize,
+    pub max_callback_calls: u32,
+    pub max_callback_concurrency: u32,
+    pub max_callback_input: u32,
+    pub max_callback_output: u32,
     pub env: Vec<(String, String)>,
     pub static_mode: bool,
+}
+
+impl Budgets {
+    pub fn callback_request_limit(&self) -> usize {
+        (self.max_callback_concurrency as usize)
+            .saturating_mul(
+                (self.max_callback_input as usize)
+                    .saturating_mul(6)
+                    .saturating_add(2048),
+            )
+            .saturating_add(4096)
+            .min(64 * 1024 * 1024)
+    }
+
+    pub fn callback_completion_limit(&self) -> usize {
+        (self.max_callback_output as usize)
+            .saturating_mul(6)
+            .saturating_add(4096)
+            .min(64 * 1024 * 1024)
+    }
 }
 
 struct Limiter {
@@ -346,46 +370,168 @@ impl Sandbox {
     }
 }
 
-pub fn run(
-    runtime: &Runtime,
-    wasm: &[u8],
-    input: &[u8],
-    opts: &Budgets,
-    control: Control,
-) -> Result<Vec<u8>, (&'static str, String)> {
-    if input.len() > opts.max_input {
-        return Err(("input_limit", "input limit exceeded".into()));
-    }
-    if wasm.len() > opts.max_module {
-        return Err(("module_limit", "Wasm module limit exceeded".into()));
-    }
-    let mut sandbox = Sandbox::new(&runtime.engine, input, opts, control.clone())
-        .map_err(|error| ("trap", error.to_string()))?;
-    let result = (|| -> anyhow::Result<()> {
-        control.check()?;
-        let key: [u8; 32] = Sha256::digest(wasm).into();
-        let cached = runtime.cache.lock().unwrap().get(&key);
-        let module = match cached {
-            Some(module) => module,
-            None => {
-                let module = Module::from_binary(&runtime.engine, wasm)?;
-                // Cache compilation even if execution or JSON decoding subsequently fails.
-                runtime.cache.lock().unwrap().insert(key, module.clone());
-                module
-            }
-        };
-        control.check()?;
-        let mut linker = Sandbox::linker(&runtime.engine)?;
-        if !opts.static_mode {
-            let plugin = linker.instantiate(&mut sandbox.store, &runtime.plugin)?;
-            linker.instance(&mut sandbox.store, &runtime.namespace, plugin)?;
+pub struct Execution {
+    sandbox: Sandbox,
+    bridge: Option<Bridge>,
+    max_step: usize,
+    max_completion: usize,
+    max_diagnostic: usize,
+}
+
+struct Bridge {
+    memory: Memory,
+    realloc: TypedFunc<(u32, u32, u32, u32), u32>,
+    step: TypedFunc<(u32, u32), u32>,
+}
+
+pub enum Progress {
+    Done(Vec<u8>),
+    Pending(Vec<u8>),
+}
+
+impl Execution {
+    pub fn start(
+        runtime: &Runtime,
+        wasm: &[u8],
+        input: &[u8],
+        opts: &Budgets,
+        control: Control,
+    ) -> Result<Self, (&'static str, String)> {
+        if input.len() > opts.max_input {
+            return Err(("input_limit", "input limit exceeded".into()));
         }
-        let instance = linker.instantiate(&mut sandbox.store, &module)?;
-        instance
-            .get_typed_func::<(), ()>(&mut sandbox.store, "_start")?
-            .call(&mut sandbox.store, ())?;
-        Ok(())
-    })();
-    sandbox.finish(result)?;
-    Ok(sandbox.stdout.contents())
+        if wasm.len() > opts.max_module {
+            return Err(("module_limit", "Wasm module limit exceeded".into()));
+        }
+        let mut sandbox = Sandbox::new(&runtime.engine, input, opts, control.clone())
+            .map_err(|error| ("trap", error.to_string()))?;
+        let result = (|| -> anyhow::Result<Option<Instance>> {
+            control.check()?;
+            let key: [u8; 32] = Sha256::digest(wasm).into();
+            let cached = runtime.cache.lock().unwrap().get(&key);
+            let module = match cached {
+                Some(module) => module,
+                None => {
+                    let module = Module::from_binary(&runtime.engine, wasm)?;
+                    // Cache compilation even if execution or JSON decoding subsequently fails.
+                    runtime.cache.lock().unwrap().insert(key, module.clone());
+                    module
+                }
+            };
+            control.check()?;
+            let mut linker = Sandbox::linker(&runtime.engine)?;
+            let provider = if !opts.static_mode {
+                let plugin = linker.instantiate(&mut sandbox.store, &runtime.plugin)?;
+                linker.instance(&mut sandbox.store, &runtime.namespace, plugin)?;
+                Some(plugin)
+            } else {
+                None
+            };
+            let instance = linker.instantiate(&mut sandbox.store, &module)?;
+            let provider = provider.unwrap_or(instance);
+            let resumable = provider
+                .get_func(&mut sandbox.store, "javex-step-v1")
+                .is_some();
+            if resumable {
+                provider
+                    .get_typed_func::<(u32, u32, u32), ()>(
+                        &mut sandbox.store,
+                        "javex-configure-v1",
+                    )?
+                    .call(
+                        &mut sandbox.store,
+                        (
+                            opts.max_callback_calls,
+                            opts.max_callback_concurrency,
+                            opts.max_callback_input,
+                        ),
+                    )?;
+            }
+            instance
+                .get_typed_func::<(), ()>(&mut sandbox.store, "_start")?
+                .call(&mut sandbox.store, ())?;
+            Ok(if resumable { Some(provider) } else { None })
+        })();
+        let provider = sandbox.finish(result)?;
+        let bridge = provider
+            .map(|provider| -> anyhow::Result<_> {
+                Ok(Bridge {
+                    memory: provider
+                        .get_memory(&mut sandbox.store, "memory")
+                        .ok_or_else(|| anyhow::anyhow!("provider has no memory"))?,
+                    realloc: provider.get_typed_func(&mut sandbox.store, "cabi_realloc")?,
+                    step: provider.get_typed_func(&mut sandbox.store, "javex-step-v1")?,
+                })
+            })
+            .transpose()
+            .map_err(|e| ("trap", e.to_string()))?;
+        Ok(Self {
+            sandbox,
+            bridge,
+            max_step: opts.callback_request_limit(),
+            max_completion: opts.callback_completion_limit(),
+            max_diagnostic: opts.max_stderr,
+        })
+    }
+
+    pub fn advance(&mut self, completion: &[u8]) -> Result<Progress, (&'static str, String)> {
+        let Some(Bridge {
+            memory,
+            realloc,
+            step,
+        }) = &self.bridge
+        else {
+            return Ok(Progress::Done(self.sandbox.stdout.contents()));
+        };
+        let result = (|| -> anyhow::Result<(u32, Vec<u8>)> {
+            self.sandbox.control.check()?;
+            anyhow::ensure!(
+                completion.len() <= self.max_completion,
+                "callback completion limit exceeded"
+            );
+            let store = &mut self.sandbox.store;
+            let len = u32::try_from(completion.len())?;
+            let ptr = realloc.call(&mut *store, (0, 0, 1, len))?;
+            memory.write(&mut *store, ptr as usize, completion)?;
+            let record = step.call(&mut *store, (ptr, len))?;
+            let mut fields = [0; 12];
+            memory.read(&mut *store, record as usize, &mut fields)?;
+            let tag = u32::from_le_bytes(fields[0..4].try_into()?);
+            let result_ptr = u32::from_le_bytes(fields[4..8].try_into()?) as usize;
+            let result_len = u32::from_le_bytes(fields[8..12].try_into()?) as usize;
+            match tag {
+                0 => anyhow::ensure!(
+                    result_len <= self.max_step,
+                    "callback request frame limit exceeded"
+                ),
+                1 if result_len > self.max_diagnostic => return Ok((2, Vec::new())),
+                1 => {}
+                _ => anyhow::bail!("invalid provider result tag"),
+            }
+            let mut bytes = vec![0; result_len];
+            memory.read(&mut *store, result_ptr, &mut bytes)?;
+            realloc.call(&mut *store, (ptr, len, 1, 0))?;
+            Ok((tag, bytes))
+        })();
+        let (tag, bytes) = self.sandbox.finish(result)?;
+        if tag == 2 {
+            return Err((
+                "diagnostic_limit",
+                "JavaScript diagnostic limit exceeded".into(),
+            ));
+        }
+        if tag != 0 {
+            return Err(("js_error", String::from_utf8_lossy(&bytes).into_owned()));
+        }
+        let state: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| ("trap", e.to_string()))?;
+        if state["fatal"] == true {
+            return Err(("callback_limit", "callback budget exceeded".into()));
+        }
+        if state["done"] == true {
+            Ok(Progress::Done(self.sandbox.stdout.contents()))
+        } else {
+            Ok(Progress::Pending(bytes))
+        }
+    }
 }

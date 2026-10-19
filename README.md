@@ -55,11 +55,94 @@ Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify({hello: "world"})))
 | Compile a JS snippet | `Javex.compile/2` |
 | Run a compiled module with JSON I/O | `Javex.run(mod, input)` |
 | Run with raw bytes | `Javex.run(mod, bytes, encoding: :raw)` |
+| Grant a host capability | `Javex.run(mod, input, callbacks: %{"name" => &MyApp.callback/2})` |
 | Cap fuel, memory, or timeout | `Javex.run(mod, input, fuel: …, max_memory: …, timeout: …)` |
 | Set runtime defaults | `Javex.Runtime.start_link(name: :strict, default_fuel: …, default_max_memory: …)` |
 | Inspect active calls and cache usage | `Javex.Runtime.stats()` |
 
 Persisting compiled modules? `%Javex.Module{}` is a plain struct — `:erlang.term_to_binary/1` round-trips it, no helper needed.
+
+## Asynchronous host callbacks
+
+`Javex.Host.call(name, argument)` returns a real Promise. Top-level `await`,
+sequential calls and `Promise.all` work on both backends. Each run grants its own
+named callbacks; runtimes never carry grants or credentials across runs.
+
+For example, expose a narrow HTTP capability, not an unrestricted proxy:
+
+```elixir
+js = ~S"""
+const products = await Promise.all([
+  Javex.Host.call("catalog.product", {id: "p123"}),
+  Javex.Host.call("catalog.product", {id: "p456"})
+]);
+Javy.IO.writeSync(1, new TextEncoder().encode(JSON.stringify(products)));
+"""
+
+{:ok, mod} = Javex.compile(js, runtime: :untrusted_js)
+Javex.run(mod, nil,
+  runtime: :untrusted_js,
+  callbacks: %{"catalog.product" => &MyApp.Catalog.product/2},
+  callback_timeout: 1_500,
+  max_callback_calls: 8,
+  max_callback_concurrency: 2
+)
+```
+
+The application supplies `MyApp.Catalog` and its HTTP client. For example, with
+Finch installed and a `MyApp.Finch` pool supervised by the application:
+
+```elixir
+defmodule MyApp.Catalog do
+  def product(%{"id" => id}, %{deadline: deadline}) when is_binary(id) do
+    if !Regex.match?(~r/\A[a-zA-Z0-9_-]{1,64}\z/, id), do: raise("invalid product ID")
+    remaining = deadline - System.monotonic_time(:millisecond)
+    if remaining <= 0, do: raise("deadline elapsed")
+
+    # Neither the base URL nor credentials are chosen by JavaScript.
+    token = Application.fetch_env!(:my_app, :catalog_token)
+    request = Finch.build(:get, "https://catalog.example.com/products/" <> id,
+      [{"authorization", "Bearer " <> token}])
+
+    {:ok, response} = Finch.stream(request, MyApp.Finch, %{status: nil, body: ""}, fn
+      {:status, status}, acc -> %{acc | status: status}
+      {:data, chunk}, acc ->
+        if byte_size(acc.body) + byte_size(chunk) > 65_536 or
+             System.monotonic_time(:millisecond) >= deadline,
+          do: raise("response budget exceeded")
+        %{acc | body: acc.body <> chunk}
+      _, acc -> acc
+    end, pool_timeout: remaining, receive_timeout: remaining)
+
+    {:ok, %{"status" => response.status, "body" => response.body}}
+  end
+end
+```
+
+Finch does not follow redirects automatically. Keep destination, methods,
+redirect/DNS policy and credentials in trusted host code. The example bounds
+the body while streaming; checking its size after buffering would be too late.
+HTTP is not a Javex dependency, and `fetch` is not installed: the generic bridge
+does not implement the browser Request/Response, streaming or AbortSignal APIs.
+
+Callbacks receive one JSON value and an absolute monotonic millisecond deadline.
+Return `{:ok, json}` or `{:error, %{"code" => code, "message" => safe_message}}`.
+JSON objects use string keys; encode binary bodies explicitly (for example base64),
+and use strings for integers beyond JavaScript's safe range. Names are non-empty
+UTF-8 strings of at most 128 bytes, with at most 128 grants per run.
+
+Declared errors reject with `HostError` (`code` and `message`). Missing grants use
+`capability_denied`; crashes and invalid results use sanitized `callback_failed`
+messages. Rejections propagated to the root module fail with `:js_error`.
+Callback limits and timeouts terminate the run even if JavaScript catches errors.
+Concurrency limits reject excess work rather than building an unbounded queue.
+
+Execution ends when the root module evaluation settles. Await all required work;
+detached callbacks are cancelled before a successful run returns. Caller death,
+runtime shutdown and deadlines also stop owned callback processes. Host callbacks
+run outside the guest's memory and OS limits. Propagate their deadline to your
+client and cancel separately owned tasks; killing a callback cannot undo an HTTP
+request already received by a server. There is no per-call AbortSignal API yet.
 
 ## 🛡 Safety knobs
 
@@ -93,6 +176,10 @@ Jason errors; sandbox failures return `Javex.RuntimeError`:
 | `max_input`, `max_output` | 1 MiB each |
 | `max_stderr` | 64 KiB diagnostics |
 | `max_module` | 8 MiB input Wasm |
+| `max_callback_calls` | 32 attempts per run; maximum 1,024; zero disables callbacks |
+| `max_callback_concurrency` | 4 outstanding calls; maximum 1,024 |
+| `callback_timeout` | 1,000 ms per callback, bounded by the run deadline |
+| `max_callback_input`, `max_callback_output` | 64 KiB argument / 256 KiB result or error; maximum 8 MiB each |
 | Runtime `max_concurrency` | 4 active calls; excess calls return `:busy` |
 | Runtime `max_cached_modules`, `max_cache_bytes` | 64 modules / 64 MiB compiled images, LRU eviction |
 
@@ -157,11 +244,14 @@ and cold compilation costs apply on every call. IPC requests/responses have a
   are configured. The host environment is never inherited, no filesystem
   directories are preopened, and no network capability is granted.
 - The bundled JavaScript API provides synchronous `Javy.IO`, TextEncoder and
-  TextDecoder, and standard QuickJS intrinsics. It is **not Node or Deno**:
-  there is no `fetch`, filesystem/path API, external module loading, timers,
-  or Promise event loop. Pending Promise jobs fail rather than running later.
+  TextDecoder, standard QuickJS intrinsics, Promises, top-level `await`, and
+  explicit `Javex.Host.call` capabilities. It is **not Node or Deno**:
+  there is no `fetch`, filesystem/path API, external module loading or timers.
+  A root awaiting a Promise with no possible completion reaches the run deadline.
   WASI environment pairs are not a JavaScript `process.env` API.
-- Clocks and randomness are not deterministic. The module provider hash checks
+- Runtime clocks are not deterministic. Snapshot-seeded `Math.random` can repeat
+  across instances and is not cryptographically secure; obtain security-sensitive
+  randomness from a host callback. The module provider hash checks
   compatibility, not authenticity. Persist only trusted module metadata and
   use `:erlang.binary_to_term(bytes, [:safe])` only for trusted serialized data.
 - The default `:in_process` backend is for trusted workloads: native JIT work
@@ -172,7 +262,7 @@ and cold compilation costs apply on every call. IPC requests/responses have a
   containers to cap the whole application. Process isolation assumes a trusted
   Linux kernel and does not eliminate kernel vulnerabilities or side channels.
 
-Javex supplies bounded synchronous computation. Workflow persistence, retries,
+Javex supplies bounded computation and explicitly granted host calls. Workflow persistence, retries,
 credentials, tools, permissions and external effects belong in the automation
 layer above it. Do not execute agent-generated JS as trusted Elixir host code.
 
@@ -181,27 +271,26 @@ layer above it. Do not execute agent-generated JS as trusted Elixir host code.
 - Compilation runs the provider's `compile-src` ABI inside a fuel/memory/deadline-limited Wasm store, then emits a small wrapper (or embeds the provider in static mode). No JS runs as native host code.
 - In-process runtimes share a Wasmtime engine and one epoch clock thread. Each owns a compiled provider, bounded worker admission, and a bounded native-module cache. Isolated runtimes instead launch fresh OS-restricted workers.
 - Every `run/3` creates a fresh Wasmtime `Store` and provider instance. The cache avoids repeat native compilation, including for modules whose execution fails.
+- The resumable provider returns control between Promise continuations. Elixir runs callbacks in monitored processes, then resumes the same store with correlated results. I/O waits occupy no dirty NIF scheduler. Isolated workers exchange bounded callback/completion frames; their OS network restrictions remain unchanged.
 - The Rust NIF and worker executable ship **precompiled** for macOS (Apple Silicon + Intel) and Linux (aarch64 + x86_64 GNU). The isolated backend is Linux-only. No Rust toolchain required to install.
 
 ### Bundled provider provenance
 
-`priv/javy_plugin.wasm` is the initialized default provider from
-[Javy v8.1.1](https://github.com/bytecodealliance/javy/releases/tag/v8.1.1), using
-namespace `javy-default-plugin-v3`. The bundled bytes match the decompressed
-official `plugin.wasm.gz` asset exactly. Reproduce or verify them with:
+`priv/javy_plugin.wasm` is Javex's custom resumable provider, built from the pinned
+Javy 7.0.0 runtime used by [Javy CLI v8.1.1](https://github.com/bytecodealliance/javy/releases/tag/v8.1.1).
+It is **not** the upstream default provider. Source, locked dependencies,
+build instructions and the versioned ABI are in `native/javex_plugin/`.
+Install the mise toolchain, clang/libclang and Javy CLI 8.1.1, then rebuild with:
 
 ```sh
-curl -fL https://github.com/bytecodealliance/javy/releases/download/v8.1.1/plugin.wasm.gz -o /tmp/javy-plugin.wasm.gz
-echo '52e3c83235f7735cb294e119a1a4b7be0a503323d5b8967eff8c0e516f3da8e1  /tmp/javy-plugin.wasm.gz' | sha256sum -c -
-gzip -dc /tmp/javy-plugin.wasm.gz > /tmp/javy-plugin.wasm
-echo '9a1f5310999888e39b7712e43384291cdc8cf84eaa409faf5338959d901ecacc  /tmp/javy-plugin.wasm' | sha256sum -c -
-cmp /tmp/javy-plugin.wasm priv/javy_plugin.wasm
+bash native/javex_plugin/build.sh
 ```
 
 Provider changes require compatibility tests and recompilation of dynamic
 modules. Custom providers must be trusted, initialized Javy providers supporting
 the same `cabi_realloc` / `compile-src` / `invoke` ABI; the namespace alone does
-not establish compatibility or trust.
+not establish compatibility or trust. Providers without Javex's resumable ABI
+retain synchronous execution and do not provide `Javex.Host`.
 
 ## Development and verification
 
